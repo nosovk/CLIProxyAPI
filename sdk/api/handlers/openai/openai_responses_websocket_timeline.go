@@ -3,7 +3,6 @@ package openai
 import (
 	"bytes"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -32,8 +31,8 @@ type websocketTimelineLog struct {
 	source  *requestlogging.FileBodySource
 	builder *strings.Builder
 
-	currentPart       io.WriteCloser
-	currentPartHasLog bool
+	currentPartHasLog       bool
+	currentPartNeedsNewline bool
 }
 
 func newWebsocketTimelineLog(enabled bool, source *requestlogging.FileBodySource) *websocketTimelineLog {
@@ -77,18 +76,8 @@ func (l *websocketTimelineLog) BeginRequest() {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.beginRequestLocked()
-}
-
-func (l *websocketTimelineLog) beginRequestLocked() {
 	l.closeCurrentPart()
-	part, errCreate := l.source.CreatePart("request")
-	if errCreate != nil {
-		log.WithError(errCreate).Warn("failed to create websocket request detail log")
-		return
-	}
-	l.currentPart = part
-	l.currentPartHasLog = false
+	l.currentPartNeedsNewline = l.source.HasPayload()
 }
 
 func (l *websocketTimelineLog) Append(eventType string, payload []byte, timestamp time.Time) {
@@ -102,17 +91,16 @@ func (l *websocketTimelineLog) Append(eventType string, payload []byte, timestam
 		return
 	}
 	if l.source != nil {
-		if l.currentPart == nil {
-			l.beginRequestLocked()
+		prependNewline := l.currentPartHasLog || l.currentPartNeedsNewline
+		if prependNewline {
+			data = append([]byte{'\n'}, data...)
 		}
-		if l.currentPart == nil {
-			return
-		}
-		if errWrite := writeWebsocketTimelinePart(l.currentPart, data, l.currentPartHasLog); errWrite != nil {
+		if errWrite := l.source.AppendBytes(data); errWrite != nil {
 			log.WithError(errWrite).Warn("failed to write websocket request detail log")
 			return
 		}
 		l.currentPartHasLog = true
+		l.currentPartNeedsNewline = false
 		return
 	}
 	if l.builder != nil {
@@ -162,27 +150,11 @@ func (l *websocketTimelineLog) String() string {
 }
 
 func (l *websocketTimelineLog) closeCurrentPart() {
-	if l == nil || l.currentPart == nil {
+	if l == nil {
 		return
 	}
-	if errClose := l.currentPart.Close(); errClose != nil {
-		log.WithError(errClose).Warn("failed to close websocket request detail log")
-	}
-	l.currentPart = nil
 	l.currentPartHasLog = false
-}
-
-func writeWebsocketTimelinePart(w io.Writer, data []byte, prependNewline bool) error {
-	if w == nil || len(data) == 0 {
-		return nil
-	}
-	if prependNewline {
-		if _, errWrite := io.WriteString(w, "\n"); errWrite != nil {
-			return errWrite
-		}
-	}
-	_, errWrite := w.Write(data)
-	return errWrite
+	l.currentPartNeedsNewline = false
 }
 
 func writeWebsocketTimelineBuilder(builder *strings.Builder, data []byte) {

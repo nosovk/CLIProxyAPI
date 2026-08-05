@@ -1104,6 +1104,9 @@ observability:
     # Record proxy request/response logs. Management requests are excluded.
     request-log: false
 
+    # Format for request log files: "text" (default) or "json" (NDJSON)
+    request-log-format: "text"
+
   usage:
     # When false, disable in-memory usage statistics aggregation
     usage-statistics-enabled: false
