@@ -52,13 +52,20 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 
 		loggerEnabled := logger.IsEnabled()
 		captureBody := shouldCaptureRequestBody(loggerEnabled, c.Request)
+		logFormat := ""
+		if formatter, ok := logger.(interface{ RequestLogFormat() string }); ok {
+			logFormat = formatter.RequestLogFormat()
+		}
 
 		// Capture request metadata before authentication without reading the request body.
-		requestInfo, err := captureRequestInfo(c, false)
+		// The body is captured after authentication so rejected requests do not incur the
+		// full-body read and decompression cost.
+		requestInfo, err := captureRequestInfo(c, false, logFormat)
 		if err != nil {
 			c.Next()
 			return
 		}
+		requestInfo.LogFormat = logFormat
 
 		// Create response writer wrapper
 		wrapper := NewResponseWriterWrapper(c.Writer, logger, requestInfo)
@@ -66,7 +73,7 @@ func RequestLoggingMiddleware(logger logging.RequestLogger) gin.HandlerFunc {
 			wrapper.logOnErrorOnly = true
 		}
 		c.Writer = wrapper
-		attachRequestLogSources(c, logger, loggerEnabled)
+		attachRequestLogSources(c, logger, loggerEnabled, requestInfo.LogFormat)
 		deferredCapture := attachDeferredRequestBodyCapture(c.Request, logger, requestInfo, false, false)
 		if captureBody {
 			c.Set(authenticatedRequestBodyCapturerContextKey, func() {
@@ -117,6 +124,10 @@ func CaptureAuthenticatedRequestBody(c *gin.Context) {
 		return
 	}
 	capturer()
+}
+
+type formattedFileBodySourceFactory interface {
+	NewFileBodySourceWithFormat(prefix, format string) (*logging.FileBodySource, error)
 }
 
 type deferredRequestBodyCapture struct {
@@ -329,7 +340,7 @@ func (c *deferredRequestBodyCapture) Cleanup() {
 	c.source = nil
 }
 
-func attachRequestLogSources(c *gin.Context, logger logging.RequestLogger, loggerEnabled bool) {
+func attachRequestLogSources(c *gin.Context, logger logging.RequestLogger, loggerEnabled bool, format string) {
 	if c == nil || !loggerEnabled {
 		return
 	}
@@ -337,20 +348,26 @@ func attachRequestLogSources(c *gin.Context, logger logging.RequestLogger, logge
 	if !ok || factory == nil {
 		return
 	}
-	if source, errSource := factory.NewFileBodySource("api-request"); errSource == nil {
+	newSource := factory.NewFileBodySource
+	if formattedFactory, ok := logger.(formattedFileBodySourceFactory); ok {
+		newSource = func(prefix string) (*logging.FileBodySource, error) {
+			return formattedFactory.NewFileBodySourceWithFormat(prefix, format)
+		}
+	}
+	if source, errSource := newSource("api-request"); errSource == nil {
 		c.Set(logging.APIRequestSourceContextKey, source)
 	}
-	if source, errSource := factory.NewFileBodySource("api-response"); errSource == nil {
+	if source, errSource := newSource("api-response"); errSource == nil {
 		c.Set(logging.APIResponseSourceContextKey, source)
+	}
+	if source, errSource := newSource("api-websocket-timeline"); errSource == nil {
+		c.Set(logging.APIWebsocketTimelineSourceContextKey, source)
 	}
 	if !isResponsesWebsocketUpgrade(c.Request) {
 		return
 	}
-	if source, errSource := factory.NewFileBodySource("websocket-timeline"); errSource == nil {
+	if source, errSource := newSource("websocket-timeline"); errSource == nil {
 		c.Set(logging.WebsocketTimelineSourceContextKey, source)
-	}
-	if source, errSource := factory.NewFileBodySource("api-websocket-timeline"); errSource == nil {
-		c.Set(logging.APIWebsocketTimelineSourceContextKey, source)
 	}
 }
 
@@ -384,7 +401,7 @@ func shouldCaptureRequestBody(loggerEnabled bool, req *http.Request) bool {
 // captureRequestInfo extracts relevant information from the incoming HTTP request.
 // It captures the URL, method, headers, and body. The request body is read and then
 // restored so that it can be processed by subsequent handlers.
-func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) {
+func captureRequestInfo(c *gin.Context, captureBody bool, logFormat string) (*RequestInfo, error) {
 	// Capture URL with sensitive query parameters masked
 	maskedQuery := util.MaskSensitiveQuery(c.Request.URL.RawQuery)
 	url := c.Request.URL.Path
@@ -409,6 +426,7 @@ func captureRequestInfo(c *gin.Context, captureBody bool) (*RequestInfo, error) 
 		Headers:   headers,
 		RequestID: logging.GetGinRequestID(c),
 		Timestamp: time.Now(),
+		LogFormat: logFormat,
 	}
 	if captureBody {
 		if errCapture := captureRequestInfoBody(c, info); errCapture != nil {
@@ -433,7 +451,13 @@ func captureRequestInfoBody(c *gin.Context, info *RequestInfo) error {
 	if maxBytes <= 0 || maxBytes > maxDeferredErrorRequestBodyBytes {
 		maxBytes = maxDeferredErrorRequestBodyBytes
 	}
+	if strings.EqualFold(strings.TrimSpace(info.LogFormat), "json") && maxBytes > logging.MaxJSONFileBackedSectionBytes {
+		maxBytes = logging.MaxJSONFileBackedSectionBytes
+	}
 	info.Body = decodeCapturedRequestBodyForLogWithLimit(bodyBytes, c.Request.Header.Get("Content-Encoding"), maxBytes)
+	if strings.EqualFold(strings.TrimSpace(info.LogFormat), "json") && int64(len(info.Body)) > logging.MaxJSONFileBackedSectionBytes {
+		info.Body = info.Body[:logging.MaxJSONFileBackedSectionBytes]
+	}
 	return nil
 }
 
