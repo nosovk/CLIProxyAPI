@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -29,13 +30,15 @@ type FileStreamingLogWriter struct {
 	requestHeaders map[string][]string
 
 	// requestBodyPath is a temporary file path holding the request body.
-	requestBodyPath string
+	requestBodyPath      string
+	requestBodyTruncated bool
 
 	// responseBodyPath is a temporary file path holding the streaming response body.
 	responseBodyPath string
 
 	// responseBodyFile is the temp file where chunks are appended by the async writer.
 	responseBodyFile *os.File
+	responseBodySize int
 
 	// chunkChan is a channel for receiving response chunks to spool.
 	chunkChan chan []byte
@@ -68,10 +71,15 @@ type FileStreamingLogWriter struct {
 	apiResponseSource *FileBodySource
 
 	// apiWebsocketTimeline stores the upstream websocket event timeline.
-	apiWebsocketTimeline []byte
+	apiWebsocketTimeline       []byte
+	apiWebsocketTimelineSource *FileBodySource
 
 	// apiResponseTimestamp captures when the API response was received.
 	apiResponseTimestamp time.Time
+
+	format string
+
+	responseBodyTruncated atomic.Bool
 }
 
 // WriteChunkAsync writes a response chunk asynchronously (non-blocking).
@@ -92,7 +100,12 @@ func (w *FileStreamingLogWriter) WriteChunkAsync(chunk []byte) {
 	case w.chunkChan <- chunkCopy:
 	default:
 		// Channel is full, skip this chunk to avoid blocking
+		w.responseBodyTruncated.Store(true)
 	}
+}
+
+func (w *FileStreamingLogWriter) MarkResponseBodyTruncated() {
+	w.responseBodyTruncated.Store(true)
 }
 
 // WriteStatus buffers the response status and headers for later writing.
@@ -184,6 +197,15 @@ func (w *FileStreamingLogWriter) WriteAPIWebsocketTimeline(apiWebsocketTimeline 
 	return nil
 }
 
+// WriteAPIWebsocketTimelineSource buffers a file-backed upstream websocket timeline.
+func (w *FileStreamingLogWriter) WriteAPIWebsocketTimelineSource(source *FileBodySource) error {
+	if source == nil || !source.HasPayload() {
+		return nil
+	}
+	w.apiWebsocketTimelineSource = source
+	return nil
+}
+
 func (w *FileStreamingLogWriter) SetFirstChunkTimestamp(timestamp time.Time) {
 	if !timestamp.IsZero() {
 		w.apiResponseTimestamp = timestamp
@@ -197,6 +219,7 @@ func (w *FileStreamingLogWriter) SetFirstChunkTimestamp(timestamp time.Time) {
 // Returns:
 //   - error: An error if closing fails, nil otherwise
 func (w *FileStreamingLogWriter) Close() error {
+	defer cleanupFileBodySources(w.apiRequestSource, w.apiResponseSource, w.apiWebsocketTimelineSource)
 	if w.chunkChan != nil {
 		close(w.chunkChan)
 	}
@@ -246,6 +269,17 @@ func (w *FileStreamingLogWriter) asyncWriter() {
 		if w.responseBodyFile == nil {
 			continue
 		}
+		if w.format == "json" {
+			remaining := maxJSONStreamingResponseBytes - w.responseBodySize
+			if remaining <= 0 {
+				w.responseBodyTruncated.Store(true)
+				continue
+			}
+			if len(chunk) > remaining {
+				chunk = chunk[:remaining]
+				w.responseBodyTruncated.Store(true)
+			}
+		}
 		if _, errWrite := w.responseBodyFile.Write(chunk); errWrite != nil {
 			select {
 			case w.errorChan <- errWrite:
@@ -258,7 +292,9 @@ func (w *FileStreamingLogWriter) asyncWriter() {
 				}
 			}
 			w.responseBodyFile = nil
+			continue
 		}
+		w.responseBodySize += len(chunk)
 	}
 
 	if w.responseBodyFile == nil {
@@ -274,10 +310,15 @@ func (w *FileStreamingLogWriter) asyncWriter() {
 }
 
 func (w *FileStreamingLogWriter) writeFinalLog(logFile *os.File) error {
-	if errWrite := writeRequestInfoWithBody(logFile, w.url, w.method, w.requestHeaders, nil, w.requestBodyPath, w.timestamp, "http", inferUpstreamTransport(w.apiRequest, w.apiRequestSource, w.apiResponse, w.apiResponseSource, w.apiWebsocketTimeline, nil, nil), true); errWrite != nil {
+	upstreamTransport := inferUpstreamTransport(w.apiRequest, w.apiRequestSource, w.apiResponse, w.apiResponseSource, w.apiWebsocketTimeline, w.apiWebsocketTimelineSource)
+	if w.format == "json" {
+		return writeJSONLog(logFile, w.url, w.method, w.requestHeaders, nil, w.requestBodyPath, w.requestBodyTruncated, w.responseStatus, w.responseHeaders, nil, w.responseBodyPath, w.responseBodyTruncated.Load(), nil, w.apiRequest, w.apiRequestSource, w.apiResponse, w.apiResponseSource, nil, nil, nil, w.apiWebsocketTimeline, w.apiWebsocketTimelineSource, w.timestamp, w.apiResponseTimestamp, "http", upstreamTransport)
+	}
+
+	if errWrite := writeRequestInfoWithBody(logFile, w.url, w.method, w.requestHeaders, nil, w.requestBodyPath, w.timestamp, "http", upstreamTransport, true); errWrite != nil {
 		return errWrite
 	}
-	if errWrite := writeAPISection(logFile, "=== API WEBSOCKET TIMELINE ===\n", "=== API WEBSOCKET TIMELINE", w.apiWebsocketTimeline, time.Time{}); errWrite != nil {
+	if errWrite := writeAPISectionWithSource(logFile, "=== API WEBSOCKET TIMELINE ===\n", "=== API WEBSOCKET TIMELINE", w.apiWebsocketTimeline, w.apiWebsocketTimelineSource, time.Time{}); errWrite != nil {
 		return errWrite
 	}
 	if errWrite := writePreformattedAPISectionWithSource(logFile, "=== API REQUEST ===\n", "=== API REQUEST", w.apiRequest, w.apiRequestSource, time.Time{}); errWrite != nil {

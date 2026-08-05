@@ -25,6 +25,7 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 	requestHeaders map[string][]string,
 	requestBody []byte,
 	requestBodyPath string,
+	requestBodyTruncated bool,
 	websocketTimeline []byte,
 	websocketTimelineSource *FileBodySource,
 	apiRequest []byte,
@@ -46,7 +47,14 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 	}
 	isWebsocketTranscript := hasSectionPayload(websocketTimeline) || hasFileBodySourcePayload(websocketTimelineSource)
 	downstreamTransport := inferDownstreamTransport(requestHeaders, websocketTimeline, websocketTimelineSource)
-	upstreamTransport := inferUpstreamTransport(apiRequest, apiRequestSource, apiResponse, apiResponseSource, apiWebsocketTimeline, apiWebsocketTimelineSource, apiResponseErrors)
+	upstreamTransport := inferUpstreamTransport(apiRequest, apiRequestSource, apiResponse, apiResponseSource, apiWebsocketTimeline, apiWebsocketTimelineSource)
+	format := requestLogFormatFromSources(apiRequestSource, apiResponseSource, websocketTimelineSource, apiWebsocketTimelineSource)
+	if format == "" {
+		format = l.currentFormat()
+	}
+	if format == "json" {
+		return writeJSONLog(w, url, method, requestHeaders, requestBody, requestBodyPath, requestBodyTruncated, statusCode, responseHeaders, response, "", false, decompressErr, apiRequest, apiRequestSource, apiResponse, apiResponseSource, apiResponseErrors, websocketTimeline, websocketTimelineSource, apiWebsocketTimeline, apiWebsocketTimelineSource, requestTimestamp, apiResponseTimestamp, downstreamTransport, upstreamTransport)
+	}
 	if errWrite := writeRequestInfoWithBody(w, url, method, requestHeaders, requestBody, requestBodyPath, requestTimestamp, downstreamTransport, upstreamTransport, !isWebsocketTranscript); errWrite != nil {
 		return errWrite
 	}
@@ -72,6 +80,15 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 		return nil
 	}
 	return writeResponseSection(w, statusCode, true, responseHeaders, bytes.NewReader(response), decompressErr, true)
+}
+
+func requestLogFormatFromSources(sources ...*FileBodySource) string {
+	for _, source := range sources {
+		if format := source.Format(); format != "" {
+			return format
+		}
+	}
+	return ""
 }
 
 func writeRequestInfoWithBody(
@@ -229,7 +246,7 @@ func inferDownstreamTransport(headers map[string][]string, websocketTimeline []b
 	return "http"
 }
 
-func inferUpstreamTransport(apiRequest []byte, apiRequestSource *FileBodySource, apiResponse []byte, apiResponseSource *FileBodySource, apiWebsocketTimeline []byte, apiWebsocketTimelineSource *FileBodySource, _ []*interfaces.ErrorMessage) string {
+func inferUpstreamTransport(apiRequest []byte, apiRequestSource *FileBodySource, apiResponse []byte, apiResponseSource *FileBodySource, apiWebsocketTimeline []byte, apiWebsocketTimelineSource *FileBodySource) string {
 	hasHTTP := hasSectionPayload(apiRequest) || hasFileBodySourcePayload(apiRequestSource) || hasSectionPayload(apiResponse) || hasFileBodySourcePayload(apiResponseSource)
 	hasWS := hasSectionPayload(apiWebsocketTimeline) || hasFileBodySourcePayload(apiWebsocketTimelineSource)
 	switch {
@@ -449,7 +466,7 @@ func (l *FileRequestLogger) formatLogContent(url, method string, headers map[str
 	var content strings.Builder
 	isWebsocketTranscript := hasSectionPayload(websocketTimeline)
 	downstreamTransport := inferDownstreamTransport(headers, websocketTimeline, nil)
-	upstreamTransport := inferUpstreamTransport(apiRequest, nil, apiResponse, nil, apiWebsocketTimeline, nil, apiResponseErrors)
+	upstreamTransport := inferUpstreamTransport(apiRequest, nil, apiResponse, nil, apiWebsocketTimeline, nil)
 
 	// Request info
 	content.WriteString(l.formatRequestInfo(url, method, headers, body, downstreamTransport, upstreamTransport, !isWebsocketTranscript))
@@ -543,15 +560,11 @@ func (l *FileRequestLogger) formatLogContent(url, method string, headers map[str
 }
 
 // decompressResponse decompresses response data based on Content-Encoding header.
-//
-// Parameters:
-//   - responseHeaders: The response headers
-//   - response: The response data to decompress
-//
-// Returns:
-//   - []byte: The decompressed response data
-//   - error: An error if decompression fails, nil otherwise
 func (l *FileRequestLogger) decompressResponse(responseHeaders map[string][]string, response []byte) ([]byte, error) {
+	return l.decompressResponseWithLimit(responseHeaders, response, 0)
+}
+
+func (l *FileRequestLogger) decompressResponseWithLimit(responseHeaders map[string][]string, response []byte, limit int64) ([]byte, error) {
 	if responseHeaders == nil || len(response) == 0 {
 		return response, nil
 	}
@@ -567,28 +580,39 @@ func (l *FileRequestLogger) decompressResponse(responseHeaders map[string][]stri
 
 	switch contentEncoding {
 	case "gzip":
-		return l.decompressGzip(response)
+		return l.decompressGzipWithLimit(response, limit)
 	case "deflate":
-		return l.decompressDeflate(response)
+		return l.decompressDeflateWithLimit(response, limit)
 	case "br":
-		return l.decompressBrotli(response)
+		return l.decompressBrotliWithLimit(response, limit)
 	case "zstd":
-		return l.decompressZstd(response)
+		return l.decompressZstdWithLimit(response, limit)
 	default:
 		// No compression or unsupported compression
 		return response, nil
 	}
 }
 
+func readDecompressedWithLimit(reader io.Reader, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		return io.ReadAll(reader)
+	}
+	decompressed, err := io.ReadAll(io.LimitReader(reader, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(decompressed)) > limit {
+		return decompressed[:limit], nil
+	}
+	return decompressed, nil
+}
+
 // decompressGzip decompresses gzip-encoded data.
-//
-// Parameters:
-//   - data: The gzip-encoded data to decompress
-//
-// Returns:
-//   - []byte: The decompressed data
-//   - error: An error if decompression fails, nil otherwise
 func (l *FileRequestLogger) decompressGzip(data []byte) ([]byte, error) {
+	return l.decompressGzipWithLimit(data, 0)
+}
+
+func (l *FileRequestLogger) decompressGzipWithLimit(data []byte, limit int64) ([]byte, error) {
 	reader, err := gzip.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create gzip reader: %w", err)
@@ -599,7 +623,7 @@ func (l *FileRequestLogger) decompressGzip(data []byte) ([]byte, error) {
 		}
 	}()
 
-	decompressed, err := io.ReadAll(reader)
+	decompressed, err := readDecompressedWithLimit(reader, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decompress gzip data: %w", err)
 	}
@@ -608,14 +632,11 @@ func (l *FileRequestLogger) decompressGzip(data []byte) ([]byte, error) {
 }
 
 // decompressDeflate decompresses deflate-encoded data.
-//
-// Parameters:
-//   - data: The deflate-encoded data to decompress
-//
-// Returns:
-//   - []byte: The decompressed data
-//   - error: An error if decompression fails, nil otherwise
 func (l *FileRequestLogger) decompressDeflate(data []byte) ([]byte, error) {
+	return l.decompressDeflateWithLimit(data, 0)
+}
+
+func (l *FileRequestLogger) decompressDeflateWithLimit(data []byte, limit int64) ([]byte, error) {
 	reader := flate.NewReader(bytes.NewReader(data))
 	defer func() {
 		if errClose := reader.Close(); errClose != nil {
@@ -623,7 +644,7 @@ func (l *FileRequestLogger) decompressDeflate(data []byte) ([]byte, error) {
 		}
 	}()
 
-	decompressed, err := io.ReadAll(reader)
+	decompressed, err := readDecompressedWithLimit(reader, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decompress deflate data: %w", err)
 	}
@@ -632,17 +653,14 @@ func (l *FileRequestLogger) decompressDeflate(data []byte) ([]byte, error) {
 }
 
 // decompressBrotli decompresses brotli-encoded data.
-//
-// Parameters:
-//   - data: The brotli-encoded data to decompress
-//
-// Returns:
-//   - []byte: The decompressed data
-//   - error: An error if decompression fails, nil otherwise
 func (l *FileRequestLogger) decompressBrotli(data []byte) ([]byte, error) {
+	return l.decompressBrotliWithLimit(data, 0)
+}
+
+func (l *FileRequestLogger) decompressBrotliWithLimit(data []byte, limit int64) ([]byte, error) {
 	reader := brotli.NewReader(bytes.NewReader(data))
 
-	decompressed, err := io.ReadAll(reader)
+	decompressed, err := readDecompressedWithLimit(reader, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decompress brotli data: %w", err)
 	}
@@ -651,21 +669,18 @@ func (l *FileRequestLogger) decompressBrotli(data []byte) ([]byte, error) {
 }
 
 // decompressZstd decompresses zstd-encoded data.
-//
-// Parameters:
-//   - data: The zstd-encoded data to decompress
-//
-// Returns:
-//   - []byte: The decompressed data
-//   - error: An error if decompression fails, nil otherwise
 func (l *FileRequestLogger) decompressZstd(data []byte) ([]byte, error) {
+	return l.decompressZstdWithLimit(data, 0)
+}
+
+func (l *FileRequestLogger) decompressZstdWithLimit(data []byte, limit int64) ([]byte, error) {
 	decoder, err := zstd.NewReader(bytes.NewReader(data))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create zstd reader: %w", err)
 	}
 	defer decoder.Close()
 
-	decompressed, err := io.ReadAll(decoder)
+	decompressed, err := readDecompressedWithLimit(decoder, limit)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decompress zstd data: %w", err)
 	}

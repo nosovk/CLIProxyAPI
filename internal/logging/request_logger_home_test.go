@@ -150,6 +150,40 @@ func TestFileRequestLogger_HomeEnabled_ForwardsWhenRequestLogEnabled(t *testing.
 	}
 }
 
+func TestFileRequestLogger_HomeEnabled_BoundsNonStreamingJSONBodies(t *testing.T) {
+	original := currentHomeRequestLogClient
+	defer func() { currentHomeRequestLogClient = original }()
+
+	stub := &stubHomeRequestLogClient{heartbeatOK: true}
+	currentHomeRequestLogClient = func() homeRequestLogClient { return stub }
+
+	logger := NewFileRequestLoggerWithFormat(true, t.TempDir(), "", 0, "json")
+	logger.SetHomeEnabled(true)
+	err := logger.LogRequest(
+		"/v1/chat/completions", http.MethodPost, nil,
+		bytes.Repeat([]byte("r"), maxJSONFileBackedSectionBytes+1024),
+		http.StatusOK, nil, bytes.Repeat([]byte("s"), maxJSONStreamingResponseBytes+1024),
+		nil, nil, nil, nil, nil, "home-json-non-stream-1", time.Now(), time.Time{},
+	)
+	if err != nil {
+		t.Fatalf("LogRequest error: %v", err)
+	}
+
+	var envelope struct {
+		RequestLog string `json:"request_log"`
+	}
+	if err := json.Unmarshal(stub.pushed[0], &envelope); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	var entry jsonLogPayload
+	if err := json.Unmarshal([]byte(envelope.RequestLog), &entry); err != nil {
+		t.Fatalf("unmarshal request log: %v", err)
+	}
+	if !entry.RequestBodyTruncated || entry.Response == nil || !entry.Response.BodyTruncated {
+		t.Fatalf("missing truncation markers: request=%v response=%+v", entry.RequestBodyTruncated, entry.Response)
+	}
+}
+
 func TestFileRequestLogger_LogRequestWithSourcesWritesLocalLogAndCleansParts(t *testing.T) {
 	logsDir := t.TempDir()
 	logger := NewFileRequestLogger(true, logsDir, "", 0)
@@ -346,6 +380,170 @@ func TestFileRequestLogger_HomeEnabled_ForwardsStreamingRequestID(t *testing.T) 
 	}
 	if got.RequestLog == "" {
 		t.Fatalf("request_log empty, want non-empty")
+	}
+}
+
+func TestFileRequestLogger_HomeEnabled_BoundsStreamingJSONBodies(t *testing.T) {
+	original := currentHomeRequestLogClient
+	defer func() { currentHomeRequestLogClient = original }()
+
+	stub := &stubHomeRequestLogClient{heartbeatOK: true}
+	currentHomeRequestLogClient = func() homeRequestLogClient { return stub }
+
+	logger := NewFileRequestLoggerWithFormat(true, t.TempDir(), "", 0, "json")
+	logger.SetHomeEnabled(true)
+	writer, err := logger.LogStreamingRequest(
+		"/v1/chat/completions", http.MethodPost, nil,
+		bytes.Repeat([]byte("r"), maxJSONFileBackedSectionBytes+1024), "home-json-bounded-1",
+	)
+	if err != nil {
+		t.Fatalf("LogStreamingRequest error: %v", err)
+	}
+	writer.WriteChunkAsync(bytes.Repeat([]byte("s"), maxJSONStreamingResponseBytes+1024))
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+
+	var envelope struct {
+		RequestLog string `json:"request_log"`
+	}
+	if err := json.Unmarshal(stub.pushed[0], &envelope); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	var entry jsonLogPayload
+	if err := json.Unmarshal([]byte(envelope.RequestLog), &entry); err != nil {
+		t.Fatalf("request_log is not JSON: %v", err)
+	}
+	if entry.URL != "/v1/chat/completions" {
+		t.Fatalf("url = %q", entry.URL)
+	}
+	if !entry.RequestBodyTruncated {
+		t.Fatalf("expected request body to be marked truncated")
+	}
+	if len(entry.RequestBodyRaw) > maxJSONFileBackedSectionBytes {
+		t.Fatalf("request body length = %d", len(entry.RequestBodyRaw))
+	}
+	if entry.Response == nil || !entry.Response.BodyTruncated {
+		t.Fatalf("expected response body to be marked truncated")
+	}
+	if len(entry.Response.BodyRaw) > maxJSONStreamingResponseBytes {
+		t.Fatalf("response body length = %d", len(entry.Response.BodyRaw))
+	}
+}
+
+func TestFileRequestLogger_HomeEnabled_BoundsStreamingJSONUpstreamSources(t *testing.T) {
+	original := currentHomeRequestLogClient
+	defer func() { currentHomeRequestLogClient = original }()
+
+	stub := &stubHomeRequestLogClient{heartbeatOK: true}
+	currentHomeRequestLogClient = func() homeRequestLogClient { return stub }
+
+	tempDir := t.TempDir()
+	logger := NewFileRequestLoggerWithFormat(true, tempDir, "", 0, "json")
+	logger.SetHomeEnabled(true)
+	streamWriter, err := logger.LogStreamingRequest("/v1/chat/completions", http.MethodPost, nil, nil, "home-json-sources-1")
+	if err != nil {
+		t.Fatalf("LogStreamingRequest error: %v", err)
+	}
+	sourceWriter, ok := streamWriter.(interface {
+		WriteAPIRequestSource(*FileBodySource) error
+		WriteAPIResponseSource(*FileBodySource) error
+		WriteAPIWebsocketTimelineSource(*FileBodySource) error
+	})
+	if !ok {
+		t.Fatalf("Home streaming writer does not implement source interface")
+	}
+	requestSource := newLargeFileBodySource(t, tempDir, "home-api-request")
+	responseSource := newLargeFileBodySource(t, tempDir, "home-api-response")
+	timelineSource := newLargeFileBodySource(t, tempDir, "home-api-websocket-timeline")
+	requestPaths := requestSource.Paths()
+	responsePaths := responseSource.Paths()
+	timelinePaths := timelineSource.Paths()
+	if err := sourceWriter.WriteAPIRequestSource(requestSource); err != nil {
+		t.Fatalf("WriteAPIRequestSource: %v", err)
+	}
+	if err := sourceWriter.WriteAPIResponseSource(responseSource); err != nil {
+		t.Fatalf("WriteAPIResponseSource: %v", err)
+	}
+	if err := sourceWriter.WriteAPIWebsocketTimelineSource(timelineSource); err != nil {
+		t.Fatalf("WriteAPIWebsocketTimelineSource: %v", err)
+	}
+	if err := streamWriter.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+
+	var envelope struct {
+		RequestLog string `json:"request_log"`
+	}
+	if err := json.Unmarshal(stub.pushed[0], &envelope); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	var entry jsonLogPayload
+	if err := json.Unmarshal([]byte(envelope.RequestLog), &entry); err != nil {
+		t.Fatalf("unmarshal request log: %v", err)
+	}
+	if !entry.APIRequestTruncated || !entry.APIResponseTruncated {
+		t.Fatalf("upstream truncation markers: request=%v response=%v", entry.APIRequestTruncated, entry.APIResponseTruncated)
+	}
+	if !entry.APIWebsocketTimelineTruncated {
+		t.Fatal("api websocket timeline was not marked truncated")
+	}
+	paths := append(requestPaths, responsePaths...)
+	assertFileBodySourceCleaned(t, append(paths, timelinePaths...))
+}
+
+func TestFileRequestLogger_HomeEnabled_DoesNotTruncateStreamingTextBodies(t *testing.T) {
+	original := currentHomeRequestLogClient
+	defer func() { currentHomeRequestLogClient = original }()
+
+	stub := &stubHomeRequestLogClient{heartbeatOK: true}
+	currentHomeRequestLogClient = func() homeRequestLogClient { return stub }
+
+	requestBody := bytes.Repeat([]byte("r"), maxJSONFileBackedSectionBytes+1024)
+	responseBody := bytes.Repeat([]byte("s"), maxJSONStreamingResponseBytes+1024)
+	logger := NewFileRequestLoggerWithFormat(true, t.TempDir(), "", 0, "text")
+	logger.SetHomeEnabled(true)
+	writer, err := logger.LogStreamingRequest(
+		"/v1/chat/completions", http.MethodPost, nil, requestBody, "home-text-unbounded-1",
+	)
+	if err != nil {
+		t.Fatalf("LogStreamingRequest error: %v", err)
+	}
+	writer.WriteChunkAsync(responseBody)
+	timelineSource, err := NewFileBodySourceInDir(t.TempDir(), "home-text-api-websocket-timeline")
+	if err != nil {
+		t.Fatalf("NewFileBodySourceInDir failed: %v", err)
+	}
+	if err := timelineSource.AppendPart([]byte("source-backed websocket timeline")); err != nil {
+		t.Fatalf("AppendPart failed: %v", err)
+	}
+	sourceWriter, ok := writer.(interface {
+		WriteAPIWebsocketTimelineSource(*FileBodySource) error
+	})
+	if !ok {
+		t.Fatalf("writer type %T does not accept websocket timeline sources", writer)
+	}
+	if err := sourceWriter.WriteAPIWebsocketTimelineSource(timelineSource); err != nil {
+		t.Fatalf("WriteAPIWebsocketTimelineSource failed: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close error: %v", err)
+	}
+
+	var envelope struct {
+		RequestLog string `json:"request_log"`
+	}
+	if err := json.Unmarshal(stub.pushed[0], &envelope); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	if !strings.Contains(envelope.RequestLog, string(requestBody[len(requestBody)-1024:])) {
+		t.Fatalf("text Home log truncated request body")
+	}
+	if !strings.Contains(envelope.RequestLog, string(responseBody[len(responseBody)-1024:])) {
+		t.Fatalf("text Home log truncated response body")
+	}
+	if !strings.Contains(envelope.RequestLog, "source-backed websocket timeline") {
+		t.Fatal("Home text log omitted source-backed websocket timeline")
 	}
 }
 
