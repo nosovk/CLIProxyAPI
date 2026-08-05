@@ -3,6 +3,7 @@ package middleware
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -262,6 +263,43 @@ func TestRequestLoggingMiddlewareCapturesLargeErrorRequestAndDeferredAPIRequest(
 	}
 }
 
+func TestRequestLoggingMiddlewareKeepsErrorLogFormatAcrossReload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	logsDir := t.TempDir()
+	logger := logging.NewFileRequestLoggerWithFormat(false, logsDir, "", 10, "json")
+	router := gin.New()
+	router.Use(RequestLoggingMiddleware(logger))
+	router.POST("/v1/responses", func(c *gin.Context) {
+		logger.SetFormat("text")
+		c.JSON(http.StatusBadRequest, gin.H{"error": "rejected"})
+	})
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{"model":"test"}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+
+	entries, errReadDir := os.ReadDir(logsDir)
+	if errReadDir != nil {
+		t.Fatalf("read logs dir: %v", errReadDir)
+	}
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), "error-") || !strings.HasSuffix(entry.Name(), ".log") {
+			continue
+		}
+		content, errRead := os.ReadFile(logsDir + string(os.PathSeparator) + entry.Name())
+		if errRead != nil {
+			t.Fatalf("read error log: %v", errRead)
+		}
+		if !json.Valid(content) {
+			t.Fatalf("error log used reloaded text format: %q", content)
+		}
+		return
+	}
+	t.Fatal("forced error log was not created")
+}
+
 func TestAttachRequestLogSourcesUsesLoggerLogsDir(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -272,7 +310,7 @@ func TestAttachRequestLogSourcesUsesLoggerLogsDir(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodGet, "/backend-api/codex/responses", nil)
 	c.Request.Header.Set("Upgrade", "websocket")
 
-	attachRequestLogSources(c, logger, true)
+	attachRequestLogSources(c, logger, true, "json")
 	defer cleanupFileBodySourcesFromContext(c)
 
 	for _, key := range []string{
@@ -301,11 +339,70 @@ func TestAttachRequestLogSourcesUsesLoggerLogsDir(t *testing.T) {
 	}
 }
 
+func TestAttachRequestLogSourcesIncludesUpstreamWebsocketTimelineForHTTP(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	logger := logging.NewFileRequestLoggerWithFormat(true, t.TempDir(), "", 0, "json")
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+
+	attachRequestLogSources(c, logger, true, "json")
+	defer cleanupFileBodySourcesFromContext(c)
+
+	value, exists := c.Get(logging.APIWebsocketTimelineSourceContextKey)
+	if !exists {
+		t.Fatal("expected upstream websocket timeline source for ordinary HTTP request")
+	}
+	source, ok := value.(*logging.FileBodySource)
+	if !ok || source == nil {
+		t.Fatalf("source type = %T", value)
+	}
+	payload := bytes.Repeat([]byte("frame"), (8<<20)/5+1)
+	if err := source.AppendPart(payload); err != nil {
+		t.Fatalf("AppendPart failed: %v", err)
+	}
+	if !source.Truncated() {
+		t.Fatal("upstream websocket timeline source is not bounded")
+	}
+}
+
+func TestRequestLogSourcesKeepFormatSnapshotAcrossReload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger := logging.NewFileRequestLoggerWithFormat(true, t.TempDir(), "", 0, "json")
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(`{}`))
+	attachRequestLogSources(c, logger, true, "json")
+	defer cleanupFileBodySourcesFromContext(c)
+	logger.SetFormat("text")
+
+	value, exists := c.Get(logging.APIRequestSourceContextKey)
+	if !exists {
+		t.Fatal("expected API request source")
+	}
+	source, ok := value.(*logging.FileBodySource)
+	if !ok || source == nil {
+		t.Fatalf("source type = %T", value)
+	}
+	if source.Format() != "json" {
+		t.Fatalf("source format = %q, want json", source.Format())
+	}
+	if err := source.AppendBytes(bytes.Repeat([]byte("x"), (8<<20)+1)); err != nil {
+		t.Fatalf("AppendBytes failed: %v", err)
+	}
+	if !source.Truncated() {
+		t.Fatal("source lost JSON bound after format reload")
+	}
+}
+
 func cleanupFileBodySourcesFromContext(c *gin.Context) {
 	if c == nil {
 		return
 	}
 	for _, key := range []string{
+		logging.APIRequestSourceContextKey,
+		logging.APIResponseSourceContextKey,
 		logging.WebsocketTimelineSourceContextKey,
 		logging.APIWebsocketTimelineSourceContextKey,
 	} {
@@ -365,7 +462,7 @@ func TestCaptureRequestInfoDecodesZstdRequestBodyForLog(t *testing.T) {
 	req.Header.Set("Content-Encoding", "zstd")
 	c.Request = req
 
-	info, errCapture := captureRequestInfo(c, true)
+	info, errCapture := captureRequestInfo(c, true, "")
 	if errCapture != nil {
 		t.Fatalf("captureRequestInfo: %v", errCapture)
 	}
@@ -514,7 +611,7 @@ func TestCaptureRequestInfo_HeadersDeepCopy(t *testing.T) {
 	req.Header.Set("X-Audit", "original-value")
 	c.Request = req
 
-	info, err := captureRequestInfo(c, false)
+	info, err := captureRequestInfo(c, false, "")
 	if err != nil {
 		t.Fatalf("captureRequestInfo failed: %v", err)
 	}
@@ -524,5 +621,72 @@ func TestCaptureRequestInfo_HeadersDeepCopy(t *testing.T) {
 
 	if got := info.Headers["X-Audit"][0]; got != "original-value" {
 		t.Fatalf("header slice was aliased: got %q, want %q", got, "original-value")
+	}
+}
+
+func TestCaptureRequestInfo_BoundsJSONRequestBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	// Create an oversized body (10 MB > 8 MB cap)
+	oversized := bytes.Repeat([]byte("a"), 10<<20)
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	req := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(oversized))
+	c.Request = req
+
+	info, errCapture := captureRequestInfo(c, true, "json")
+	if errCapture != nil {
+		t.Fatalf("captureRequestInfo: %v", errCapture)
+	}
+
+	if int64(len(info.Body)) > logging.MaxJSONFileBackedSectionBytes {
+		t.Fatalf("captured JSON request body length %d exceeds max %d", len(info.Body), logging.MaxJSONFileBackedSectionBytes)
+	}
+
+	// Ensure the HTTP request body was restored completely for the handler
+	restored, errRead := io.ReadAll(c.Request.Body)
+	if errRead != nil {
+		t.Fatalf("read restored body: %v", errRead)
+	}
+	if len(restored) != len(oversized) {
+		t.Fatalf("restored body length = %d, want %d", len(restored), len(oversized))
+	}
+}
+
+func TestAppendAPIWebsocketTimeline_UsesSingleFilePart(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	dir := t.TempDir()
+	source, errSource := logging.NewFileBodySourceInDir(dir, "api-websocket-timeline")
+	if errSource != nil {
+		t.Fatalf("NewFileBodySourceInDir: %v", errSource)
+	}
+	defer source.Cleanup()
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Set(logging.APIWebsocketTimelineSourceContextKey, source)
+
+	ctx := context.WithValue(context.Background(), "gin", c)
+	cfg := &config.Config{SDKConfig: config.SDKConfig{RequestLog: true}}
+
+	// Append multiple websocket timeline events
+	helps.AppendAPIWebsocketResponse(ctx, cfg, []byte("event-1"))
+	helps.AppendAPIWebsocketResponse(ctx, cfg, []byte("event-2"))
+	helps.AppendAPIWebsocketResponse(ctx, cfg, []byte("event-3"))
+
+	paths := source.Paths()
+	if len(paths) != 1 {
+		t.Fatalf("expected exactly 1 file part for appended timeline, got %d paths: %v", len(paths), paths)
+	}
+
+	var buf bytes.Buffer
+	if _, errWrite := source.WriteTo(&buf); errWrite != nil {
+		t.Fatalf("WriteTo: %v", errWrite)
+	}
+	output := buf.String()
+	if !strings.Contains(output, "event-1") || !strings.Contains(output, "event-2") || !strings.Contains(output, "event-3") {
+		t.Fatalf("unexpected combined timeline content: %q", output)
 	}
 }

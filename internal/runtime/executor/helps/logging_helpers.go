@@ -584,7 +584,13 @@ func appendAPIWebsocketTimeline(ginCtx *gin.Context, chunk []byte) {
 		return
 	}
 	if source, ok := apiWebsocketTimelineSource(ginCtx); ok {
-		if errAppend := source.AppendPart(data); errAppend == nil {
+		var payload []byte
+		if source.BytesWritten() > 0 {
+			payload = append([]byte("\n\n"), data...)
+		} else {
+			payload = data
+		}
+		if errAppend := source.AppendBytes(payload); errAppend == nil {
 			return
 		} else {
 			log.WithError(errAppend).Warn("failed to append api websocket timeline log part")

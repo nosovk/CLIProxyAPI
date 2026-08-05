@@ -6,6 +6,8 @@ package logging
 import (
 	"fmt"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
@@ -144,6 +146,9 @@ type FileRequestLogger struct {
 	errorLogsMaxFiles int
 
 	homeEnabled bool
+
+	// format stores the normalized log entry structure ("text" or "json").
+	format atomic.Value
 }
 
 // NewFileRequestLogger creates a new file-based request logger.
@@ -158,6 +163,11 @@ type FileRequestLogger struct {
 // Returns:
 //   - *FileRequestLogger: A new file-based request logger instance
 func NewFileRequestLogger(enabled bool, logsDir string, configDir string, errorLogsMaxFiles int) *FileRequestLogger {
+	return NewFileRequestLoggerWithFormat(enabled, logsDir, configDir, errorLogsMaxFiles, "text")
+}
+
+// NewFileRequestLoggerWithFormat creates a file request logger with the selected output format.
+func NewFileRequestLoggerWithFormat(enabled bool, logsDir string, configDir string, errorLogsMaxFiles int, format string) *FileRequestLogger {
 	// Resolve logsDir relative to the configuration file directory when it's not absolute.
 	if !filepath.IsAbs(logsDir) {
 		// If configDir is provided, resolve logsDir relative to it.
@@ -165,12 +175,44 @@ func NewFileRequestLogger(enabled bool, logsDir string, configDir string, errorL
 			logsDir = filepath.Join(configDir, logsDir)
 		}
 	}
-	return &FileRequestLogger{
+	logger := &FileRequestLogger{
 		enabled:           enabled,
 		logsDir:           logsDir,
 		errorLogsMaxFiles: errorLogsMaxFiles,
 		homeEnabled:       false,
 	}
+	logger.format.Store(normalizeRequestLogFormat(format))
+	return logger
+}
+
+func normalizeRequestLogFormat(format string) string {
+	if strings.EqualFold(strings.TrimSpace(format), "json") {
+		return "json"
+	}
+	return "text"
+}
+
+// SetFormat updates the output format used for future request log entries.
+func (l *FileRequestLogger) SetFormat(format string) {
+	if l == nil {
+		return
+	}
+	l.format.Store(normalizeRequestLogFormat(format))
+}
+
+func (l *FileRequestLogger) currentFormat() string {
+	if l == nil {
+		return "text"
+	}
+	if format, ok := l.format.Load().(string); ok {
+		return format
+	}
+	return "text"
+}
+
+// RequestLogFormat returns the normalized format used for newly started requests.
+func (l *FileRequestLogger) RequestLogFormat() string {
+	return l.currentFormat()
 }
 
 // IsEnabled returns whether request logging is currently enabled.
@@ -197,11 +239,37 @@ func (l *FileRequestLogger) SetErrorLogsMaxFiles(maxFiles int) {
 
 // NewFileBodySource creates a temp-backed source under the request log directory.
 func (l *FileRequestLogger) NewFileBodySource(prefix string) (*FileBodySource, error) {
+	return l.NewFileBodySourceWithFormat(prefix, l.currentFormat())
+}
+
+// NewFileBodySourceWithFormat creates a source using a per-request format snapshot.
+func (l *FileRequestLogger) NewFileBodySourceWithFormat(prefix, format string) (*FileBodySource, error) {
 	if l == nil {
 		return nil, fmt.Errorf("file request logger is nil")
 	}
 	if errEnsure := l.ensureLogsDir(); errEnsure != nil {
 		return nil, errEnsure
 	}
-	return NewFileBodySourceInDir(l.logsDir, prefix)
+	format = normalizeRequestLogFormat(format)
+	if format == "json" && jsonFileBodySourceLimited(prefix) {
+		source, err := newLimitedFileBodySourceInDir(l.logsDir, prefix, maxJSONFileBackedSectionBytes)
+		if source != nil {
+			source.format = format
+		}
+		return source, err
+	}
+	source, err := NewFileBodySourceInDir(l.logsDir, prefix)
+	if source != nil {
+		source.format = format
+	}
+	return source, err
+}
+
+func jsonFileBodySourceLimited(prefix string) bool {
+	switch strings.ToLower(strings.TrimSpace(prefix)) {
+	case "api-request", "api-response", "websocket-timeline", "api-websocket-timeline":
+		return true
+	default:
+		return false
+	}
 }

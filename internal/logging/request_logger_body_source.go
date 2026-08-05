@@ -13,10 +13,33 @@ import (
 
 // FileBodySource stores large log sections as ordered temp-file parts.
 type FileBodySource struct {
-	mu      sync.Mutex
-	dir     string
-	paths   []string
-	cleaned bool
+	mu           sync.Mutex
+	dir          string
+	paths        []string
+	cleaned      bool
+	maxBytes     int
+	bytesWritten int
+	truncated    bool
+	format       string
+}
+
+// Format returns the request-log format captured when the source was created.
+func (s *FileBodySource) Format() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.format
+}
+
+func newLimitedFileBodySourceInDir(baseDir, prefix string, maxBytes int) (*FileBodySource, error) {
+	source, err := NewFileBodySourceInDir(baseDir, prefix)
+	if err != nil {
+		return nil, err
+	}
+	source.maxBytes = maxBytes
+	return source, nil
 }
 
 // NewFileBodySourceInDir creates a temp-backed source under baseDir.
@@ -91,11 +114,42 @@ func (s *FileBodySource) AppendPart(data []byte) error {
 	if len(data) == 0 {
 		return nil
 	}
-	file, errCreate := s.CreatePart("part")
+	if !bytes.HasSuffix(data, []byte("\n")) {
+		data = append(bytes.Clone(data), '\n')
+	}
+	return s.appendPartBytes(data)
+}
+
+func (s *FileBodySource) appendPartBytes(data []byte) error {
+	if s == nil {
+		return fmt.Errorf("file body source is nil")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cleaned {
+		return fmt.Errorf("file body source has been cleaned")
+	}
+	if s.maxBytes > 0 {
+		remaining := s.maxBytes - s.bytesWritten
+		if remaining <= 0 {
+			s.truncated = true
+			return nil
+		}
+		if len(data) > remaining {
+			data = data[:remaining]
+			s.truncated = true
+		}
+	}
+	if errMkdir := os.MkdirAll(s.dir, 0755); errMkdir != nil {
+		return errMkdir
+	}
+	file, errCreate := os.CreateTemp(s.dir, "part-*.tmp")
 	if errCreate != nil {
 		return errCreate
 	}
-	writeErr := writeLogPart(file, data, false)
+	s.paths = append(s.paths, file.Name())
+	written, writeErr := file.Write(data)
+	s.bytesWritten += written
 	if errClose := file.Close(); errClose != nil {
 		if writeErr == nil {
 			writeErr = errClose
@@ -117,6 +171,17 @@ func (s *FileBodySource) AppendBytes(data []byte) error {
 	if s.cleaned {
 		return fmt.Errorf("file body source has been cleaned")
 	}
+	if s.maxBytes > 0 {
+		remaining := s.maxBytes - s.bytesWritten
+		if remaining <= 0 {
+			s.truncated = true
+			return nil
+		}
+		if len(data) > remaining {
+			data = data[:remaining]
+			s.truncated = true
+		}
+	}
 	if errMkdir := os.MkdirAll(s.dir, 0755); errMkdir != nil {
 		return errMkdir
 	}
@@ -135,13 +200,24 @@ func (s *FileBodySource) AppendBytes(data []byte) error {
 		return errOpen
 	}
 
-	_, writeErr := file.Write(data)
+	written, writeErr := file.Write(data)
+	s.bytesWritten += written
 	if errClose := file.Close(); errClose != nil {
 		if writeErr == nil {
 			writeErr = errClose
 		}
 	}
 	return writeErr
+}
+
+// Truncated reports whether the source dropped bytes because of its write limit.
+func (s *FileBodySource) Truncated() bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.truncated
 }
 
 // HasPayload reports whether any detail parts were recorded.
@@ -152,6 +228,16 @@ func (s *FileBodySource) HasPayload() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.paths) > 0 && !s.cleaned
+}
+
+// BytesWritten returns the total number of bytes written to the source.
+func (s *FileBodySource) BytesWritten() int {
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.bytesWritten
 }
 
 // Paths returns a copy of the ordered part paths.
