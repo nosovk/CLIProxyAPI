@@ -20,6 +20,13 @@ func TestForkSyncWorkflowUsesTargetCommitForImageMetadata(t *testing.T) {
 		"type=raw,value=${{ needs.sync-and-test.outputs.commit_short_sha }}",
 		"org.opencontainers.image.revision=${{ needs.sync-and-test.outputs.commit_sha }}",
 		"org.opencontainers.image.version=${{ env.TARGET_BRANCH }}",
+		"annotations: ${{ steps.meta.outputs.annotations }}",
+	}
+	if got := strings.Count(workflow, "org.opencontainers.image.revision=${{ needs.sync-and-test.outputs.commit_sha }}"); got != 2 {
+		t.Errorf("target revision metadata occurrences = %d, want labels and annotations", got)
+	}
+	if got := strings.Count(workflow, "org.opencontainers.image.version=${{ env.TARGET_BRANCH }}"); got != 2 {
+		t.Errorf("target version metadata occurrences = %d, want labels and annotations", got)
 	}
 	for _, snippet := range required {
 		if !strings.Contains(workflow, snippet) {

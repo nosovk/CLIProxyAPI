@@ -141,6 +141,9 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ needs.sync-and-test.outputs.commit_sha }}
             org.opencontainers.image.version=${{ env.TARGET_BRANCH }}
+          annotations: |
+            org.opencontainers.image.revision=${{ needs.sync-and-test.outputs.commit_sha }}
+            org.opencontainers.image.version=${{ env.TARGET_BRANCH }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
@@ -150,6 +153,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
           build-args: |
             VERSION=fork-json-logging
             COMMIT=${{ needs.sync-and-test.outputs.commit_sha }}
