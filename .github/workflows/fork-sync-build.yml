@@ -40,6 +40,7 @@ jobs:
     outputs:
       should_build: ${{ steps.check_rebase.outputs.should_build }}
       commit_sha: ${{ steps.get_sha.outputs.commit_sha }}
+      commit_short_sha: ${{ steps.get_sha.outputs.commit_short_sha }}
     steps:
       - name: Checkout target branch
         uses: actions/checkout@v4
@@ -105,6 +106,7 @@ jobs:
         if: steps.check_rebase.outputs.should_build == 'true'
         run: |
           echo "commit_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "commit_short_sha=$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
 
   build-and-publish:
     needs: sync-and-test
@@ -134,8 +136,11 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=raw,value=latest
-            type=sha,format=short,prefix=
-            type=ref,event=branch
+            type=raw,value=${{ env.TARGET_BRANCH }}
+            type=raw,value=${{ needs.sync-and-test.outputs.commit_short_sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.sync-and-test.outputs.commit_sha }}
+            org.opencontainers.image.version=${{ env.TARGET_BRANCH }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
