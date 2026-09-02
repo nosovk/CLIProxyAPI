@@ -1,0 +1,162 @@
+name: Fork Sync and Build
+
+on:
+  schedule:
+    # Run daily at 03:00 UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build and publish Docker image'
+        type: boolean
+        default: false
+      skip_rebase:
+        description: 'Skip upstream rebase and build current branch'
+        type: boolean
+        default: false
+  push:
+    branches:
+      - feature/json-request-logging
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/cli-proxy-api
+  TARGET_BRANCH: feature/json-request-logging
+  UPSTREAM_REPO: https://github.com/router-for-me/CLIProxyAPI.git
+  UPSTREAM_BRANCH: dev
+
+jobs:
+  sync-and-test:
+    if: github.repository == 'nosovk/CLIProxyAPI'
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check_rebase.outputs.should_build }}
+      commit_sha: ${{ steps.get_sha.outputs.commit_sha }}
+      commit_short_sha: ${{ steps.get_sha.outputs.commit_short_sha }}
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync and Rebase against Upstream
+        id: check_rebase
+        run: |
+          if [ "${{ github.event.inputs.skip_rebase }}" = "true" ]; then
+            echo "Skipping upstream rebase as requested by workflow input."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          git remote add upstream ${{ env.UPSTREAM_REPO }} || true
+          git fetch upstream ${{ env.UPSTREAM_BRANCH }}
+
+          BEHIND_COUNT=$(git rev-list --count HEAD..upstream/${{ env.UPSTREAM_BRANCH }})
+          echo "Commits behind upstream/${{ env.UPSTREAM_BRANCH }}: $BEHIND_COUNT"
+
+          if [ "$BEHIND_COUNT" -eq 0 ] && [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.inputs.force_build }}" != "true" ]; then
+            echo "No upstream changes to sync."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Attempting rebase onto upstream/${{ env.UPSTREAM_BRANCH }}..."
+          if ! git rebase upstream/${{ env.UPSTREAM_BRANCH }}; then
+            echo "::error::Rebase conflict detected!"
+            git rebase --abort || true
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "should_build=true" >> $GITHUB_OUTPUT
+
+      - name: Run Go Tests
+        if: steps.check_rebase.outputs.should_build == 'true'
+        run: |
+          go test ./...
+
+      - name: Push Rebased Branch to Fork
+        if: steps.check_rebase.outputs.should_build == 'true' && github.event_name != 'push'
+        run: |
+          git push --force-with-lease origin ${{ env.TARGET_BRANCH }}
+
+      - name: Record Commit SHA
+        id: get_sha
+        if: steps.check_rebase.outputs.should_build == 'true'
+        run: |
+          echo "commit_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "commit_short_sha=$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
+
+  build-and-publish:
+    needs: sync-and-test
+    if: needs.sync-and-test.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ env.TARGET_BRANCH }}
+            type=raw,value=${{ needs.sync-and-test.outputs.commit_short_sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.sync-and-test.outputs.commit_sha }}
+            org.opencontainers.image.version=${{ env.TARGET_BRANCH }}
+          annotations: |
+            org.opencontainers.image.revision=${{ needs.sync-and-test.outputs.commit_sha }}
+            org.opencontainers.image.version=${{ env.TARGET_BRANCH }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            VERSION=fork-json-logging
+            COMMIT=${{ needs.sync-and-test.outputs.commit_sha }}
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
