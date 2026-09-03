@@ -261,11 +261,13 @@ routing:
 #       - codex-account-1
 #       - codex-account-2
 #       - codex-account-3
+#       - codex-account-4
 #   paperclip:
 #     codex:
 #       - codex-account-1
 #       - codex-account-2
 #       - codex-account-3
+#       - codex-account-4
 #       - codex-account-paperclip
 #
 # api-key-pools maps a downstream API key (the literal value from api-keys/*-api-key

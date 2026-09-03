@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"testing"
+	"time"
 
 	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
@@ -128,5 +129,101 @@ func TestCredentialPoolAllowsAppliesThroughEligibility(t *testing.T) {
 	}
 	if !eligibility.allows(claude) {
 		t.Fatalf("expected claude to remain unrestricted since only codex is pooled")
+	}
+}
+
+func TestCredentialPoolPaperclipFallbackScenario(t *testing.T) {
+	// Scenario:
+	// Accounts 1-4 are shared (priority 0).
+	// Account 5 is paperclip special fallback (priority -1).
+	// Default pool has accounts 1-4.
+	// Paperclip pool has accounts 1-5.
+	cfg := &internalconfig.Config{
+		CredentialPools: map[string]internalconfig.CredentialPool{
+			"default": {
+				Codex: []string{"codex-1", "codex-2", "codex-3", "codex-4"},
+			},
+			"paperclip": {
+				Codex: []string{"codex-1", "codex-2", "codex-3", "codex-4", "codex-5-special"},
+			},
+		},
+		APIKeyPools: map[string]string{
+			"sk-paperclip-key": "paperclip",
+			"*":                "default",
+		},
+	}
+
+	auths := []*Auth{
+		{ID: "c1", Provider: "codex", FileName: "codex-1.json", Status: StatusActive, Attributes: map[string]string{"priority": "0"}},
+		{ID: "c2", Provider: "codex", FileName: "codex-2.json", Status: StatusActive, Attributes: map[string]string{"priority": "0"}},
+		{ID: "c3", Provider: "codex", FileName: "codex-3.json", Status: StatusActive, Attributes: map[string]string{"priority": "0"}},
+		{ID: "c4", Provider: "codex", FileName: "codex-4.json", Status: StatusActive, Attributes: map[string]string{"priority": "0"}},
+		{ID: "c5", Provider: "codex", FileName: "codex-5-special.json", Status: StatusActive, Attributes: map[string]string{"priority": "-1"}},
+	}
+
+	// 1. Regular client (using default pool via "*")
+	defaultPool := ResolveCredentialPoolForAPIKey(cfg, "sk-regular-user")
+	if defaultPool == nil || defaultPool.Name != "default" {
+		t.Fatalf("expected default pool for regular user")
+	}
+	defaultCtx := WithCredentialPool(context.Background(), defaultPool)
+	defaultEligibility := authSelectionEligibilityForRequest(defaultCtx, cliproxyexecutor.Options{})
+
+	for _, a := range auths[:4] {
+		if !defaultEligibility.allows(a) {
+			t.Fatalf("regular user should have access to shared account %s", a.ID)
+		}
+	}
+	if defaultEligibility.allows(auths[4]) {
+		t.Fatalf("regular user must NOT have access to special account 5")
+	}
+
+	// 2. Paperclip client (using paperclip pool)
+	paperclipPool := ResolveCredentialPoolForAPIKey(cfg, "sk-paperclip-key")
+	if paperclipPool == nil || paperclipPool.Name != "paperclip" {
+		t.Fatalf("expected paperclip pool for paperclip key")
+	}
+	paperclipCtx := WithCredentialPool(context.Background(), paperclipPool)
+	paperclipEligibility := authSelectionEligibilityForRequest(paperclipCtx, cliproxyexecutor.Options{})
+
+	for _, a := range auths {
+		if !paperclipEligibility.allows(a) {
+			t.Fatalf("paperclip should have access to account %s", a.ID)
+		}
+	}
+
+	// 3. Priority routing verification for Paperclip:
+	// Filter candidates through paperclip eligibility
+	var paperclipCandidates []*Auth
+	for _, a := range auths {
+		if paperclipEligibility.allows(a) {
+			paperclipCandidates = append(paperclipCandidates, a)
+		}
+	}
+
+	// When all accounts are available, getAvailableAuths (which selects highest priority tier) must pick only from priority 0 (accounts 1-4)
+	avail, err := getAvailableAuths(paperclipCandidates, "codex", "gpt-4", time.Now())
+	if err != nil {
+		t.Fatalf("getAvailableAuths error: %v", err)
+	}
+	if len(avail) != 4 {
+		t.Fatalf("expected 4 shared accounts at priority 0, got %d", len(avail))
+	}
+	for _, a := range avail {
+		if a.ID == "c5" {
+			t.Fatalf("account 5 (priority -1) should not be picked while priority 0 accounts are available")
+		}
+	}
+
+	// When shared accounts (1-4) are on cooldown / disabled:
+	for _, a := range auths[:4] {
+		a.Status = StatusDisabled
+	}
+	availFallback, errFallback := getAvailableAuths(paperclipCandidates, "codex", "gpt-4", time.Now())
+	if errFallback != nil {
+		t.Fatalf("getAvailableAuths fallback error: %v", errFallback)
+	}
+	if len(availFallback) != 1 || availFallback[0].ID != "c5" {
+		t.Fatalf("expected fallback to account 5 (priority -1) when 1-4 are unavailable, got %+v", availFallback)
 	}
 }
