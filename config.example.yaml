@@ -240,6 +240,45 @@ routing:
   # Ignored when routing.session-affinity is false.
   session-affinity-subagents: true
 
+# Credential pools restrict which upstream Codex credentials a downstream API key may
+# be routed to. Only Codex is pooled here; Claude, Gemini, and every other provider
+# always stay shared across every key.
+#
+# The filter is applied before round-robin/weighted-round-robin/fill-first selection,
+# before any retry round, before cooldown-wait computation, and before session affinity
+# - so a restricted key can never reach a credential outside its pool through any code
+# path, including failover.
+#
+# A pool's "priority" per credential (set on the credential itself, not here) decides
+# the order WITHIN an allowed pool: every selector strategy always tries the highest
+# available priority tier first, and only drops to a lower tier when everything in the
+# higher tier is unavailable (cooldown/quota/disabled). Giving a dedicated credential a
+# lower priority than the shared ones turns it into an automatic fallback reserve.
+#
+# credential-pools:
+#   default:
+#     codex:
+#       - codex-account-1
+#       - codex-account-2
+#       - codex-account-3
+#   paperclip:
+#     codex:
+#       - codex-account-1
+#       - codex-account-2
+#       - codex-account-3
+#       - codex-account-paperclip
+#
+# api-key-pools maps a downstream API key (the literal value from api-keys/*-api-key
+# entries) to the credential-pools entry it is restricted to. The special "*" key sets
+# the default pool for any key with no explicit entry of its own. A key that resolves
+# to no pool at all (no explicit entry and no "*" default) remains unrestricted, which
+# preserves legacy, pre-pools behavior - so credential pools are fully opt-in and safe
+# to leave unset.
+#
+# api-key-pools:
+#   "sk-cpa-paperclip-eeeef03eba755491f9699db4fc42a616": paperclip
+#   "*": default
+
 # Codex provider behavior.
 codex:
   # When true, and routing.strategy is fill-first or routing.session-affinity is true,

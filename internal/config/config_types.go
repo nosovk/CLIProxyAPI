@@ -756,3 +756,22 @@ func (m OpenAICompatibilityModel) GetForceMapping() bool    { return m.ForceMapp
 func (m OpenAICompatibilityModel) GetIsCompat() bool        { return m.IsCompat }
 
 func (m OpenAICompatibilityModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
+
+// CredentialPool names a set of upstream Claude and/or Codex credential identifiers
+// that a downstream API key is allowed to be routed to. Each entry (claude/codex) is
+// matched against a credential's auth file name (with or without the .json extension),
+// its configured label, or its auth ID.
+//
+// A provider field left nil (omitted from YAML) stays completely unrestricted for any
+// API key resolved to this pool - e.g. a pool that only sets "codex:" leaves Claude,
+// Gemini, and everything else exactly as unrestricted as if no pool applied at all.
+//
+// A provider field that is present but empty ("codex: []") is a deliberate fail-closed:
+// it denies every credential for that provider rather than silently allowing everything.
+type CredentialPool struct {
+	// Claude lists the allowed Claude credential identifiers for this pool. Leave unset
+	// (omit entirely) to keep Claude unrestricted for keys resolved to this pool.
+	Claude []string `yaml:"claude,omitempty" json:"claude,omitempty"`
+	// Codex lists the allowed Codex credential identifiers for this pool.
+	Codex []string `yaml:"codex,omitempty" json:"codex,omitempty"`
+}

@@ -58,6 +58,7 @@ type authSelectionEligibility struct {
 	requiredKind     string
 	credentialPolicy string
 	disallowFreeAuth bool
+	credentialPool   *ResolvedCredentialPool
 }
 
 func withRequiredAuthKind(ctx context.Context, requiredKind string) context.Context {
@@ -81,6 +82,7 @@ func authSelectionEligibilityForRequest(ctx context.Context, opts cliproxyexecut
 	if ctx != nil {
 		eligibility.requiredKind, _ = ctx.Value(requiredAuthKindContextKey{}).(string)
 		eligibility.credentialPolicy, _ = ctx.Value(credentialPolicyContextKey{}).(string)
+		eligibility.credentialPool = credentialPoolFromContext(ctx)
 	}
 	return eligibility
 }
@@ -93,6 +95,9 @@ func (e authSelectionEligibility) allows(auth *Auth) bool {
 		return false
 	}
 	if e.credentialPolicy != "" && !credentialPolicyAllows(e.credentialPolicy, auth) {
+		return false
+	}
+	if e.credentialPool != nil && !e.credentialPool.Allows(auth) {
 		return false
 	}
 	return !e.disallowFreeAuth || !isFreeCodexAuth(auth)

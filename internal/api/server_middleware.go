@@ -11,6 +11,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/safemode"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v7/sdk/access"
+	sdkauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -150,6 +151,28 @@ func corsMiddleware() gin.HandlerFunc {
 // it allows all requests (legacy behaviour).
 func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 	return accessAuthMiddleware(manager, false)
+}
+
+// credentialPoolMiddleware resolves the authenticated downstream API key to a
+// configured credential pool (Config.CredentialPools / Config.APIKeyPools) and
+// attaches the resolution to the request context so every subsequent Claude/Codex
+// auth-selection call - the initial candidate list, every retry round, cooldown-wait
+// computation, and session affinity - only ever considers credentials inside that
+// pool. It must be registered after AuthMiddleware (or another middleware that sets
+// "userApiKey" in the Gin context) in the same route group.
+func (s *Server) credentialPoolMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if s == nil || s.cfg == nil {
+			c.Next()
+			return
+		}
+		rawKey, _ := c.Get("userApiKey")
+		apiKey, _ := rawKey.(string)
+		if pool := sdkauth.ResolveCredentialPoolForAPIKey(s.cfg, apiKey); pool != nil {
+			c.Request = c.Request.WithContext(sdkauth.WithCredentialPool(c.Request.Context(), pool))
+		}
+		c.Next()
+	}
 }
 
 func realtimeStandardAuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
