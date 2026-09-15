@@ -63,8 +63,8 @@ jobs:
       - name: Sync and Rebase against Upstream
         id: check_rebase
         run: |
-          if [ "${{ github.event.inputs.skip_rebase }}" = "true" ]; then
-            echo "Skipping upstream rebase as requested by workflow input."
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event.inputs.skip_rebase }}" = "true" ]; then
+            echo "Building the pushed branch without upstream rebase."
             echo "should_build=true" >> $GITHUB_OUTPUT
             exit 0
           fi
