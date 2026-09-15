@@ -22,12 +22,17 @@ func WithCredentialPool(ctx context.Context, pool *ResolvedCredentialPool) conte
 	return context.WithValue(ctx, credentialPoolContextKey{}, pool)
 }
 
-func credentialPoolFromContext(ctx context.Context) *ResolvedCredentialPool {
+// CredentialPoolFromContext returns the downstream credential restriction attached to ctx.
+func CredentialPoolFromContext(ctx context.Context) *ResolvedCredentialPool {
 	if ctx == nil {
 		return nil
 	}
 	pool, _ := ctx.Value(credentialPoolContextKey{}).(*ResolvedCredentialPool)
 	return pool
+}
+
+func credentialPoolFromContext(ctx context.Context) *ResolvedCredentialPool {
+	return CredentialPoolFromContext(ctx)
 }
 
 func ResolveCredentialPoolForAPIKey(cfg *internalconfig.Config, apiKey string) *ResolvedCredentialPool {
