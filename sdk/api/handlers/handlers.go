@@ -571,6 +571,9 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 	if c != nil && c.Request != nil {
 		requestCtx = c.Request.Context()
 	}
+	// Handlers may supply a detached parent. Preserve the authenticated request's
+	// credential restriction so execution and retries cannot escape its pool.
+	parentCtx = coreauth.WithCredentialPool(parentCtx, coreauth.CredentialPoolFromContext(requestCtx))
 
 	if requestCtx != nil {
 		parentCtx = httptransport.InheritDecorator(parentCtx, requestCtx)
