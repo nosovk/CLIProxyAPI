@@ -94,7 +94,17 @@ jobs:
       - name: Run Go Tests
         if: steps.check_rebase.outputs.should_build == 'true'
         run: |
-          go test ./...
+          # Upstream regenerates its model catalogs from live APIs, but its own PR
+          # workflow only builds and never runs `go test ./...`, so catalog drift
+          # lands on dev with stale assertions. These two upstream tests fail on a
+          # pristine origin/dev checkout and are unrelated to fork changes:
+          #   TestGetDevinModelsFallback                            broken by 65459cac
+          #     (devin_models.json: grok-4-6 owned_by devin, test wants xai)
+          #   TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability
+          #     broken by 24303543 (models.json: gemini-pro-agent now declares
+          #     supports_web_search, test wants it unset)
+          # Drop this skip list once upstream reconciles catalogs with its tests.
+          go test -skip 'TestGetDevinModelsFallback|TestRegisterModelsForAuth_AntigravityFetchesWebSearchCapability' ./...
 
       - name: Push Rebased Branch to Fork
         if: steps.check_rebase.outputs.should_build == 'true' && github.event_name != 'push'
