@@ -22,6 +22,7 @@ const (
 	schedulerStrategyRoundRobin         schedulerStrategy = 1
 	schedulerStrategyFillFirst          schedulerStrategy = 2
 	schedulerStrategyWeightedRoundRobin schedulerStrategy = 3
+	schedulerStrategyNearestReset       schedulerStrategy = 4
 )
 
 // scheduledState describes how an auth currently participates in a model shard.
@@ -50,6 +51,7 @@ type authScheduler struct {
 	authGenerations     map[string]scheduledGenerationMeta
 	mixedCursors        map[string]int
 	mixedWeightedStates map[string]*smoothWeightedState
+	mixedResetCursors   map[string]string
 }
 
 // providerScheduler stores auth metadata and model shards for a single provider.
@@ -160,6 +162,7 @@ func newAuthScheduler(selector Selector) *authScheduler {
 		authGenerations:     make(map[string]scheduledGenerationMeta),
 		mixedCursors:        make(map[string]int),
 		mixedWeightedStates: make(map[string]*smoothWeightedState),
+		mixedResetCursors:   make(map[string]string),
 	}
 }
 
@@ -170,6 +173,8 @@ func selectorStrategy(selector Selector) schedulerStrategy {
 		return schedulerStrategyFillFirst
 	case *WeightedRoundRobinSelector:
 		return schedulerStrategyWeightedRoundRobin
+	case *NearestResetSelector:
+		return schedulerStrategyNearestReset
 	case nil, *RoundRobinSelector:
 		return schedulerStrategyRoundRobin
 	default:
@@ -187,6 +192,7 @@ func (s *authScheduler) setSelector(selector Selector) {
 	s.strategy = selectorStrategy(selector)
 	clear(s.mixedCursors)
 	clear(s.mixedWeightedStates)
+	clear(s.mixedResetCursors)
 }
 
 // isSchedulableAuth determines whether an auth can be scheduled by a provider scheduler,
@@ -298,6 +304,7 @@ func (s *authScheduler) rebuild(auths []*Auth) {
 	}
 	s.mixedCursors = make(map[string]int)
 	s.mixedWeightedStates = make(map[string]*smoothWeightedState)
+	s.mixedResetCursors = make(map[string]string)
 	now := time.Now()
 	for _, auth := range auths {
 		s.upsertAuthRebuildLocked(auth, existingMetas, now)
@@ -562,6 +569,41 @@ func (s *authScheduler) pickMixedWithStrategy(ctx context.Context, providers []s
 		}
 		state.prepare(scheduledWeightVectorMatching(entries, predicate))
 		picked := pickSmoothWeightedScheduled(entries, state.current, predicate)
+		if picked != nil && picked.meta != nil {
+			return picked.auth, picked.meta.providerKey, nil
+		}
+		return nil, "", s.mixedUnavailableErrorLocked(normalized, model, predicate)
+	}
+
+	if strategy == schedulerStrategyNearestReset {
+		entries := make([]*scheduledAuth, 0)
+		for _, shard := range candidateShards {
+			if shard == nil {
+				continue
+			}
+			bucket := shard.readyByPriority[bestPriority]
+			if bucket != nil {
+				entries = append(entries, bucket.all.flat...)
+			}
+		}
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i] == nil || entries[i].auth == nil {
+				return false
+			}
+			if entries[j] == nil || entries[j].auth == nil {
+				return true
+			}
+			return entries[i].auth.ID < entries[j].auth.ID
+		})
+		unknown, nearest := partitionScheduledByReset(entries, modelKey, predicate, now)
+		picked := nearest
+		if len(unknown) > 0 {
+			if s.mixedResetCursors == nil {
+				s.mixedResetCursors = make(map[string]string)
+			}
+			picked = unknown[scheduledSuccessorIndex(unknown, s.mixedResetCursors[cursorKey])]
+			s.mixedResetCursors[cursorKey] = picked.auth.ID
+		}
 		if picked != nil && picked.meta != nil {
 			return picked.auth, picked.meta.providerKey, nil
 		}
@@ -1378,6 +1420,8 @@ func (m *modelScheduler) pickReadyAtPriorityLocked(preferWebsocket bool, priorit
 		picked = view.pickFirst(predicate)
 	case schedulerStrategyWeightedRoundRobin:
 		picked = view.pickWeighted(predicate)
+	case schedulerStrategyNearestReset:
+		picked = view.pickNearestReset(m.modelKey, predicate, time.Now())
 	default:
 		picked = view.pickRoundRobin(predicate)
 	}
@@ -1677,6 +1721,48 @@ func scheduledSuccessorIndex(entries []*scheduledAuth, lastID string) int {
 		return 0
 	}
 	return index
+}
+
+// pickNearestReset returns the ready entry whose short-window quota resets soonest.
+// Entries without an observed reset are preferred and rotated round-robin via the
+// view's lastPicked cursor so their windows get observed quickly.
+func (v *readyView) pickNearestReset(modelKey string, predicate func(*scheduledAuth) bool, now time.Time) *scheduledAuth {
+	if v == nil || len(v.flat) == 0 {
+		return nil
+	}
+	unknown, nearest := partitionScheduledByReset(v.flat, modelKey, predicate, now)
+	if len(unknown) == 0 {
+		return nearest
+	}
+	start := scheduledSuccessorIndex(unknown, v.lastPicked)
+	picked := unknown[start]
+	v.lastPicked = picked.auth.ID
+	return picked
+}
+
+// partitionScheduledByReset splits matching entries into those with no known reset (in
+// input order, which is ID-sorted) and returns the single entry with the nearest reset
+// among the rest, tie-broken by auth ID.
+func partitionScheduledByReset(entries []*scheduledAuth, modelKey string, predicate func(*scheduledAuth) bool, now time.Time) (unknown []*scheduledAuth, nearest *scheduledAuth) {
+	var nearestReset time.Time
+	for _, entry := range entries {
+		if entry == nil || entry.auth == nil {
+			continue
+		}
+		if predicate != nil && !predicate(entry) {
+			continue
+		}
+		reset, ok := quotaResetAt(entry.auth, modelKey, now)
+		if !ok {
+			unknown = append(unknown, entry)
+			continue
+		}
+		if nearest == nil || reset.Before(nearestReset) || (reset.Equal(nearestReset) && entry.auth.ID < nearest.auth.ID) {
+			nearest = entry
+			nearestReset = reset
+		}
+	}
+	return unknown, nearest
 }
 
 // pickWeighted returns the next ready entry using smooth weighted round-robin.
