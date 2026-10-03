@@ -71,6 +71,19 @@ func weightedSelectorStateModel(ctx context.Context, availabilityModel string) s
 // rolling-window subscription caps (e.g. chat message limits).
 type FillFirstSelector struct{}
 
+// NearestResetSelector prefers the available credential whose short-window quota
+// resets soonest, so spend lands on the account that recovers first.
+//
+// Credentials with no observed reset signal (fresh accounts, providers without quota
+// headers) are placed ahead of known ones and rotated round-robin among themselves so
+// their windows are learned quickly; known credentials follow ordered by reset time,
+// with auth ID as the tiebreaker.
+type NearestResetSelector struct {
+	mu         sync.Mutex
+	lastPicked map[string]string
+	maxKeys    int
+}
+
 type blockReason int
 
 const (
@@ -818,6 +831,54 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
 	return available[0], nil
+}
+
+// Pick selects the available auth with the nearest short-window quota reset.
+// Auths with an unknown reset are tried first in round-robin order.
+func (s *NearestResetSelector) Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	_ = opts
+	now := time.Now()
+	available, err := getSelectorAvailableAuths(ctx, auths, provider, model, now)
+	if err != nil {
+		return nil, err
+	}
+	available = preferCodexWebsocketAuths(ctx, provider, available)
+
+	unknown := make([]*Auth, 0, len(available))
+	var nearest *Auth
+	var nearestReset time.Time
+	for _, candidate := range available {
+		reset, ok := quotaResetAt(candidate, model, now)
+		if !ok {
+			unknown = append(unknown, candidate)
+			continue
+		}
+		if nearest == nil || reset.Before(nearestReset) || (reset.Equal(nearestReset) && candidate.ID < nearest.ID) {
+			nearest = candidate
+			nearestReset = reset
+		}
+	}
+	if len(unknown) == 0 {
+		return nearest, nil
+	}
+
+	// available arrives ID-sorted, so unknown keeps that order and successorIndex applies.
+	key := provider + ":" + canonicalModelKey(model)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.lastPicked == nil {
+		s.lastPicked = make(map[string]string)
+	}
+	limit := s.maxKeys
+	if limit <= 0 {
+		limit = 4096
+	}
+	if _, ok := s.lastPicked[key]; !ok && len(s.lastPicked) >= limit {
+		s.lastPicked = make(map[string]string)
+	}
+	picked := unknown[successorIndex(unknown, s.lastPicked[key])]
+	s.lastPicked[key] = picked.ID
+	return picked, nil
 }
 
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
