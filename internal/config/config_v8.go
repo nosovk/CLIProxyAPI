@@ -73,6 +73,9 @@ func buildV8Paths() []configPath {
 		{"host", "server.host"}, {"port", "server.port"}, {"trusted-proxies", "server.trusted-proxies"},
 		{"tls", "server.tls"}, {"commercial-mode", "server.commercial-mode"}, {"discovery", "server.discovery"},
 		{"remote-management", "management"}, {"api-keys", "access.api-keys"},
+		// Fork-only sections: downstream key pools live next to access.api-keys so the
+		// v8 migration carries them over instead of commenting them out as unknown.
+		{"credential-pools", "access.credential-pools"}, {"api-key-pools", "access.api-key-pools"},
 		{"credential-concurrency", "credentials.concurrency"}, {"credential-in-flight", "credentials.in-flight"},
 		{"force-model-prefix", "routing.force-model-prefix"},
 		{"request-retry", "routing.retry.request-retry"}, {"max-retry-credentials", "routing.retry.max-retry-credentials"},
@@ -102,6 +105,7 @@ func buildV8Paths() []configPath {
 		{"disable-image-generation", "multimedia.disable-image-generation"}, {"gpt-image-2-base-model", "multimedia.gpt-image-2-base-model"},
 		{"video-result-auth-cache-ttl", "multimedia.video-result-auth-cache-ttl"},
 		{"debug", "observability.logs.debug"}, {"logging-to-file", "observability.logs.logging-to-file"},
+		{"request-log-format", "observability.logs.request-log-format"},
 		{"logs-max-total-size-mb", "observability.logs.logs-max-total-size-mb"}, {"request-log", "observability.logs.request-log"},
 		{"error-logs-max-files", "observability.logs.error-logs-max-files"},
 		{"usage-statistics-enabled", "observability.usage.usage-statistics-enabled"},

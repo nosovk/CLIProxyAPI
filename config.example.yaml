@@ -89,6 +89,38 @@ access:
     - "your-api-key-2"
     - "your-api-key-3"
 
+  # Credential pools restrict which upstream Claude/Codex credentials a downstream API key
+  # may be routed to. A provider omitted from a pool stays unrestricted for that pool; a
+  # provider present but empty ("codex: []") denies every credential for that provider.
+  #
+  # The filter is applied before round-robin/weighted-round-robin/fill-first selection,
+  # before any retry round, before cooldown-wait computation, and before session affinity,
+  # so a restricted key can never reach a credential outside its pool through any code
+  # path, including failover. Credential "priority" still orders candidates within a pool,
+  # so a dedicated credential with a lower priority acts as an automatic fallback reserve.
+  #
+  # credential-pools:
+  #   default:
+  #     codex:
+  #       - codex-account-1
+  #       - codex-account-2
+  #       - codex-account-3
+  #   paperclip:
+  #     codex:
+  #       - codex-account-1
+  #       - codex-account-2
+  #       - codex-account-3
+  #       - codex-account-paperclip
+  #
+  # api-key-pools maps a downstream API key (the literal value from access.api-keys) to the
+  # credential-pools entry it is restricted to. The special "*" key sets the default pool
+  # for any key without its own entry. A key that resolves to no pool at all remains
+  # unrestricted, so pools are fully opt-in and safe to leave unset.
+  #
+  # api-key-pools:
+  #   "sk-cpa-paperclip-eeeef03eba755491f9699db4fc42a616": paperclip
+  #   "*": default
+
 # Optional credential concurrency and observation contracts.
 
 # credentials:
@@ -1089,6 +1121,9 @@ observability:
 
     # Record proxy request/response logs. Management requests are excluded.
     request-log: false
+
+    # Format for request log files: "text" (default) or "json" (NDJSON)
+    request-log-format: "text"
 
   usage:
     # When false, disable in-memory usage statistics aggregation
