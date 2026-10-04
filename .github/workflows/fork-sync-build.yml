@@ -287,8 +287,12 @@ jobs:
         run: |
           git remote add upstream ${{ env.UPSTREAM_REPO }} || true
           git fetch -q upstream ${{ env.UPSTREAM_BRANCH }}
-          UP=$(git rev-parse --short=7 upstream/${{ env.UPSTREAM_BRANCH }})
-          FORK_COMMITS=$(git log --format='- %h %s' upstream/${{ env.UPSTREAM_BRANCH }}..HEAD)
+          # Describe what was actually built: the upstream base is the merge-base of
+          # the built commit, not upstream HEAD (push-triggered builds skip the rebase).
+          NEW_BASE=$(git merge-base HEAD upstream/${{ env.UPSTREAM_BRANCH }})
+          UP=${NEW_BASE:0:7}
+          FORK_COMMITS=$(git log --format='- %h %s' "$NEW_BASE..HEAD")
+          UPSTREAM_LAG=$(git rev-list --count "$NEW_BASE..upstream/${{ env.UPSTREAM_BRANCH }}")
           # The previous tag is a fork SHA that a force-push may have rewritten away; the
           # commit itself is still in the fork repo (GitHub keeps pushed objects), so fetch it.
           git fetch -q origin "$OLD_TAG" 2>/dev/null || true
@@ -296,8 +300,8 @@ jobs:
             OLD_BASE=$(git merge-base "$OLD_TAG" upstream/${{ env.UPSTREAM_BRANCH }} 2>/dev/null || true)
             if [ -n "$OLD_BASE" ]; then
               UPSTREAM_RANGE="${OLD_BASE:0:7}...${UP}"
-              UPSTREAM_COUNT=$(git rev-list --count "$OLD_BASE..upstream/${{ env.UPSTREAM_BRANCH }}")
-              UPSTREAM_LOG=$(git log --format='- %h %s' "$OLD_BASE..upstream/${{ env.UPSTREAM_BRANCH }}" | head -60)
+              UPSTREAM_COUNT=$(git rev-list --count "$OLD_BASE..$NEW_BASE")
+              UPSTREAM_LOG=$(git log --format='- %h %s' "$OLD_BASE..$NEW_BASE" | head -60)
             fi
           fi
           {
@@ -310,12 +314,19 @@ jobs:
             echo "### Fork commits on top of upstream/${{ env.UPSTREAM_BRANCH }}@${UP}"
             echo "${FORK_COMMITS}"
             echo
-            if [ -n "${UPSTREAM_RANGE:-}" ]; then
+            if [ "$UPSTREAM_LAG" -gt 0 ]; then
+              echo "> Note: upstream/${{ env.UPSTREAM_BRANCH }} is ${UPSTREAM_LAG} commit(s) ahead of this build's base; the next nightly sync will pick them up."
+              echo
+            fi
+            if [ -n "${UPSTREAM_RANGE:-}" ] && [ "${UPSTREAM_COUNT}" -gt 0 ]; then
               echo "### Upstream changes since previous deploy (${UPSTREAM_COUNT} commits)"
               echo "https://github.com/router-for-me/CLIProxyAPI/compare/${UPSTREAM_RANGE}"
               echo
               echo "${UPSTREAM_LOG}"
               [ "${UPSTREAM_COUNT}" -gt 60 ] && echo "- … and $((UPSTREAM_COUNT-60)) more"
+            elif [ -n "${UPSTREAM_RANGE:-}" ]; then
+              echo "### Upstream changes since previous deploy"
+              echo "None — same upstream base (\`${UP}\`); only fork commits changed."
             else
               echo "### Upstream changes"
               echo "Previous tag \`${OLD_TAG}\` not found in fork history; see upstream/${{ env.UPSTREAM_BRANCH }} directly."
