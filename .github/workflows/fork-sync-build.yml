@@ -81,15 +81,80 @@ jobs:
             exit 0
           fi
 
+          echo "upstream_sha=$(git rev-parse --short=7 upstream/${{ env.UPSTREAM_BRANCH }})" >> $GITHUB_OUTPUT
+          echo "fork_sha=$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
+
           echo "Attempting rebase onto upstream/${{ env.UPSTREAM_BRANCH }}..."
           if ! git rebase upstream/${{ env.UPSTREAM_BRANCH }}; then
             echo "::error::Rebase conflict detected!"
+            {
+              echo "conflict_files<<EOF"
+              git diff --name-only --diff-filter=U
+              echo "EOF"
+              echo "conflict_commit=$(git log -1 --format='%h %s' REBASE_HEAD 2>/dev/null || echo unknown)"
+            } >> $GITHUB_OUTPUT
             git rebase --abort || true
             echo "should_build=false" >> $GITHUB_OUTPUT
-            exit 1
+            echo "conflict=true" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
           echo "should_build=true" >> $GITHUB_OUTPUT
+
+      - name: Open or update conflict issue
+        if: steps.check_rebase.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_SHA: ${{ steps.check_rebase.outputs.upstream_sha }}
+          FORK_SHA: ${{ steps.check_rebase.outputs.fork_sha }}
+          CONFLICT_COMMIT: ${{ steps.check_rebase.outputs.conflict_commit }}
+          CONFLICT_FILES: ${{ steps.check_rebase.outputs.conflict_files }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create upstream-sync-conflict --color B60205 --description "Nightly upstream rebase failed" --force >/dev/null 2>&1 || true
+          TITLE="Upstream sync conflict: ${{ env.UPSTREAM_BRANCH }}@${UPSTREAM_SHA} vs fork ${FORK_SHA}"
+          BODY=$(cat <<EOF
+          Nightly rebase of \`${{ env.TARGET_BRANCH }}\` onto \`upstream/${{ env.UPSTREAM_BRANCH }}\` failed.
+
+          | | |
+          |---|---|
+          | Fork HEAD | \`${FORK_SHA}\` |
+          | Upstream HEAD | \`${UPSTREAM_SHA}\` |
+          | First conflicting fork commit | \`${CONFLICT_COMMIT}\` |
+          | Run | ${RUN_URL} |
+
+          Conflicting files:
+          \`\`\`
+          ${CONFLICT_FILES}
+          \`\`\`
+
+          Until this is resolved no new image is published and production stays on the last pinned tag.
+
+          Resolve locally:
+          \`\`\`sh
+          git fetch origin ${{ env.TARGET_BRANCH }} && git checkout ${{ env.TARGET_BRANCH }}
+          git fetch ${{ env.UPSTREAM_REPO }} ${{ env.UPSTREAM_BRANCH }} && git rebase FETCH_HEAD
+          # fix, go build ./... && go test ./..., then:
+          git push --force-with-lease origin ${{ env.TARGET_BRANCH }}
+          \`\`\`
+          EOF
+          )
+          EXISTING=$(gh issue list --label upstream-sync-conflict --state open --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue edit "$EXISTING" --title "$TITLE" --body "$BODY"
+            gh issue comment "$EXISTING" --body "Still conflicting as of upstream \`${UPSTREAM_SHA}\`: ${RUN_URL}"
+          else
+            gh issue create --title "$TITLE" --body "$BODY" --label upstream-sync-conflict
+          fi
+
+      - name: Close stale conflict issue
+        if: steps.check_rebase.outputs.should_build == 'true' && github.event_name != 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for n in $(gh issue list --label upstream-sync-conflict --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --comment "Rebase onto upstream/${{ env.UPSTREAM_BRANCH }} succeeded in ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}."
+          done
 
       - name: Run Go Tests
         if: steps.check_rebase.outputs.should_build == 'true'
@@ -159,3 +224,111 @@ jobs:
             BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  propose-deploy:
+    needs: [sync-and-test, build-and-publish]
+    if: needs.sync-and-test.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_REPO: hex-drift/ai-gate
+      DEPLOY_BRANCH: deploy/cli-proxy-api-bump
+      NEW_TAG: ${{ needs.sync-and-test.outputs.commit_short_sha }}
+      NEW_SHA: ${{ needs.sync-and-test.outputs.commit_sha }}
+      GH_TOKEN: ${{ secrets.AI_GATE_PR_TOKEN }}
+    steps:
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEPLOY_REPO }}
+          token: ${{ secrets.AI_GATE_PR_TOKEN }}
+          path: ai-gate
+          fetch-depth: 0
+
+      - name: Checkout fork for changelog
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          path: fork
+          fetch-depth: 0
+
+      - name: Bump image tag
+        id: bump
+        working-directory: ai-gate
+        run: |
+          OLD_TAG=$(sed -nE 's#^\s*image: ghcr.io/nosovk/cli-proxy-api:([A-Za-z0-9._-]+)\s*$#\1#p' docker-compose.yml | head -1)
+          echo "old_tag=$OLD_TAG" >> $GITHUB_OUTPUT
+          if [ "$OLD_TAG" = "$NEW_TAG" ]; then
+            echo "Already on $NEW_TAG"; echo "changed=false" >> $GITHUB_OUTPUT; exit 0
+          fi
+          sed -i -E "s#^(\s*image: ghcr.io/nosovk/cli-proxy-api:)[A-Za-z0-9._-]+\s*\$#\1${NEW_TAG}#" docker-compose.yml
+          git diff --quiet && { echo "No image line matched"; exit 1; }
+          echo "changed=true" >> $GITHUB_OUTPUT
+
+      - name: Build changelog
+        id: log
+        if: steps.bump.outputs.changed == 'true'
+        working-directory: fork
+        env:
+          OLD_TAG: ${{ steps.bump.outputs.old_tag }}
+        run: |
+          git remote add upstream ${{ env.UPSTREAM_REPO }} || true
+          git fetch -q upstream ${{ env.UPSTREAM_BRANCH }}
+          UP=$(git rev-parse --short=7 upstream/${{ env.UPSTREAM_BRANCH }})
+          FORK_COMMITS=$(git log --format='- %h %s' upstream/${{ env.UPSTREAM_BRANCH }}..HEAD)
+          # The previous tag is a fork SHA that a force-push may have rewritten away; the
+          # commit itself is still in the fork repo (GitHub keeps pushed objects), so fetch it.
+          git fetch -q origin "$OLD_TAG" 2>/dev/null || true
+          if git cat-file -e "$OLD_TAG^{commit}" 2>/dev/null; then
+            OLD_BASE=$(git merge-base "$OLD_TAG" upstream/${{ env.UPSTREAM_BRANCH }} 2>/dev/null || true)
+            if [ -n "$OLD_BASE" ]; then
+              UPSTREAM_RANGE="${OLD_BASE:0:7}...${UP}"
+              UPSTREAM_COUNT=$(git rev-list --count "$OLD_BASE..upstream/${{ env.UPSTREAM_BRANCH }}")
+              UPSTREAM_LOG=$(git log --format='- %h %s' "$OLD_BASE..upstream/${{ env.UPSTREAM_BRANCH }}" | head -60)
+            fi
+          fi
+          {
+            echo "body<<EOF"
+            echo "Automated bump from \`fork-sync-build\`: \`${OLD_TAG}\` → \`${NEW_TAG}\`."
+            echo
+            echo "Image: \`ghcr.io/nosovk/cli-proxy-api:${NEW_TAG}\` (commit \`${NEW_SHA}\`)"
+            echo "Fork run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo "### Fork commits on top of upstream/${{ env.UPSTREAM_BRANCH }}@${UP}"
+            echo "${FORK_COMMITS}"
+            echo
+            if [ -n "${UPSTREAM_RANGE:-}" ]; then
+              echo "### Upstream changes since previous deploy (${UPSTREAM_COUNT} commits)"
+              echo "https://github.com/router-for-me/CLIProxyAPI/compare/${UPSTREAM_RANGE}"
+              echo
+              echo "${UPSTREAM_LOG}"
+              [ "${UPSTREAM_COUNT}" -gt 60 ] && echo "- … and $((UPSTREAM_COUNT-60)) more"
+            else
+              echo "### Upstream changes"
+              echo "Previous tag \`${OLD_TAG}\` not found in fork history; see upstream/${{ env.UPSTREAM_BRANCH }} directly."
+            fi
+            echo
+            echo "Merging deploys to production via doco-cd within ~60 s. Review upstream changes before merging."
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Push branch and open/update PR
+        if: steps.bump.outputs.changed == 'true'
+        working-directory: ai-gate
+        env:
+          BODY: ${{ steps.log.outputs.body }}
+          OLD_TAG: ${{ steps.bump.outputs.old_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$DEPLOY_BRANCH"
+          git add docker-compose.yml
+          git commit -m "deploy: bump cli-proxy-api to ${NEW_TAG}" -m "Automated by nosovk/CLIProxyAPI fork-sync-build. Upstream ${{ env.UPSTREAM_BRANCH }} + fork patches."
+          git push --force origin "$DEPLOY_BRANCH"
+          TITLE="deploy: bump cli-proxy-api ${OLD_TAG} → ${NEW_TAG}"
+          EXISTING=$(gh pr list --repo "$DEPLOY_REPO" --head "$DEPLOY_BRANCH" --state open --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --repo "$DEPLOY_REPO" --title "$TITLE" --body "$BODY"
+            echo "Updated PR #$EXISTING"
+          else
+            gh pr create --repo "$DEPLOY_REPO" --base main --head "$DEPLOY_BRANCH" --title "$TITLE" --body "$BODY"
+          fi
