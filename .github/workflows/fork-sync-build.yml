@@ -265,6 +265,13 @@ jobs:
           path: fork
           fetch-depth: 0
 
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Bump image tag
         id: bump
         working-directory: ai-gate
@@ -293,11 +300,14 @@ jobs:
           UP=${NEW_BASE:0:7}
           FORK_COMMITS=$(git log --format='- %h %s' "$NEW_BASE..HEAD")
           UPSTREAM_LAG=$(git rev-list --count "$NEW_BASE..upstream/${{ env.UPSTREAM_BRANCH }}")
-          # The previous tag is a fork SHA that a force-push may have rewritten away; the
-          # commit itself is still in the fork repo (GitHub keeps pushed objects), so fetch it.
-          git fetch -q origin "$OLD_TAG" 2>/dev/null || true
-          if git cat-file -e "$OLD_TAG^{commit}" 2>/dev/null; then
-            OLD_BASE=$(git merge-base "$OLD_TAG" upstream/${{ env.UPSTREAM_BRANCH }} 2>/dev/null || true)
+          # The previous tag is a fork SHA that a nightly force-push has usually rewritten
+          # away, so it is not reachable from any ref. Resolve the full SHA from the image
+          # label instead, then fetch that exact object from the fork.
+          OLD_FULL=$(docker buildx imagetools inspect "ghcr.io/nosovk/cli-proxy-api:${OLD_TAG}" --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null || true)
+          [ -z "$OLD_FULL" ] && OLD_FULL="$OLD_TAG"
+          git fetch -q origin "$OLD_FULL" 2>/dev/null || true
+          if git cat-file -e "$OLD_FULL^{commit}" 2>/dev/null; then
+            OLD_BASE=$(git merge-base "$OLD_FULL" upstream/${{ env.UPSTREAM_BRANCH }} 2>/dev/null || true)
             if [ -n "$OLD_BASE" ]; then
               UPSTREAM_RANGE="${OLD_BASE:0:7}...${UP}"
               UPSTREAM_COUNT=$(git rev-list --count "$OLD_BASE..$NEW_BASE")
