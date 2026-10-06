@@ -163,12 +163,15 @@ jobs:
           # websocket tests that flake on shared runners (e.g.
           # TestWebsocketRetryBindFailureClearsActiveSessionState). Rerun only
           # the packages that failed once before declaring the build broken.
-          if go test ./... 2>&1 | tee test.log | grep -qE '^(FAIL|ok|---)' && ! grep -q '^FAIL' test.log; then
+          set -o pipefail
+          if go test ./... 2>&1 | tee test.log; then
             exit 0
           fi
-          FAILED=$(grep -E '^FAIL\s+\S+' test.log | awk '{print $2}' | sort -u)
+          # `go test` prints "FAIL<TAB>pkg<TAB>time" per failed package; match any
+          # whitespace with a POSIX class since grep -E does not understand \s.
+          FAILED=$(grep -E '^FAIL[[:space:]]+[^[:space:]]+' test.log | awk '{print $2}' | sort -u)
           if [ -z "$FAILED" ]; then
-            echo "::error::go test failed without a package list"; cat test.log | tail -50; exit 1
+            echo "::error::go test failed without a package list"; tail -50 test.log; exit 1
           fi
           echo "::warning::Retrying failed packages once: $FAILED"
           # shellcheck disable=SC2086
