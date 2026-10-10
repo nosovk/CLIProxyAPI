@@ -111,7 +111,16 @@ jobs:
           CONFLICT_FILES: ${{ steps.check_rebase.outputs.conflict_files }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          gh label create upstream-sync-conflict --color B60205 --description "Nightly upstream rebase failed" --force >/dev/null 2>&1 || true
+          # `gh label create` needs the label to not exist or --force; GITHUB_TOKEN may
+          # also lack rights on some forks. Fall back to an unlabelled issue rather
+          # than losing the report, but never silently.
+          LABEL_ARGS=(--label upstream-sync-conflict)
+          if ! gh label list --json name --jq '.[].name' | grep -qx upstream-sync-conflict; then
+            if ! gh label create upstream-sync-conflict --color B60205 --description "Nightly upstream rebase failed"; then
+              echo "::warning::could not create label upstream-sync-conflict; filing issue without it"
+              LABEL_ARGS=()
+            fi
+          fi
           TITLE="Upstream sync conflict: ${{ env.UPSTREAM_BRANCH }}@${UPSTREAM_SHA} vs fork ${FORK_SHA}"
           BODY=$(cat <<EOF
           Nightly rebase of \`${{ env.TARGET_BRANCH }}\` onto \`upstream/${{ env.UPSTREAM_BRANCH }}\` failed.
@@ -144,7 +153,7 @@ jobs:
             gh issue edit "$EXISTING" --title "$TITLE" --body "$BODY"
             gh issue comment "$EXISTING" --body "Still conflicting as of upstream \`${UPSTREAM_SHA}\`: ${RUN_URL}"
           else
-            gh issue create --title "$TITLE" --body "$BODY" --label upstream-sync-conflict
+            gh issue create --title "$TITLE" --body "$BODY" "${LABEL_ARGS[@]}"
           fi
 
       - name: Close stale conflict issue
