@@ -104,7 +104,10 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 			}
 		}()
 	}
-	localFrames := opts.localInterrupt.framesChan()
+	var localFrames <-chan []byte
+	if opts.localInterrupt != nil {
+		localFrames = opts.localInterrupt.framesChan()
+	}
 
 	// handleErr ends the turn on a terminal stream error (non-nil errMsg).
 	handleErr := func(errMsg *interfaces.ErrorMessage) ([]byte, string, []string, *interfaces.ErrorMessage, error) {
@@ -249,6 +252,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					turnEnded = false
 					if opts.localInterrupt != nil {
 						opts.localInterrupt.reactivate()
+						opts.localInterrupt.setResponseID(gjson.GetBytes(payloads[i], "response.id").String())
 					}
 					outputItemsByIndex = make(map[int64][]byte)
 					outputItemsFallback = nil
@@ -367,11 +371,11 @@ func completeResponsesWebsocketLocalInterrupt(
 		cancel(errSet)
 		return output, responseID, sortedStringSet(pendingToolCallIDs), nil, errSet
 	}
+	cancel(context.Canceled)
 	if errWrite := writeResponsesWebsocketPayload(writer, wsTimelineLog, incomplete, time.Now()); errWrite != nil {
 		cancel(errWrite)
 		return output, responseID, sortedStringSet(pendingToolCallIDs), nil, errWrite
 	}
-	cancel(context.Canceled)
 	return output, responseID, sortedStringSet(pendingToolCallIDs), nil, nil
 }
 

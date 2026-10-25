@@ -916,6 +916,10 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				shouldReplayResponsesWebsocketPinnedAuthFailure(errMsg)
 		}
 
+		var localInterruptForTurn *responsesLocalInterrupt
+		if attemptedUpstreamMode == responsesWebsocketUpstreamModeHTTP {
+			localInterruptForTurn = localInterrupt
+		}
 		completedOutput, completedResponseID, completedPendingToolCallIDs, forwardErrMsg, errForward := h.forwardResponsesWebsocket(
 			c,
 			writer,

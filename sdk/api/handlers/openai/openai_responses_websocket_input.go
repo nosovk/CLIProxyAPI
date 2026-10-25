@@ -33,6 +33,7 @@ type responsesLocalInterrupt struct {
 	mu           sync.Mutex
 	active       bool
 	wsTurnActive bool
+	responseID   string
 	frames       chan []byte
 }
 
@@ -61,6 +62,11 @@ func (s *responsesLocalInterrupt) reactivate() {
 	}
 	s.mu.Lock()
 	s.active = true
+	s.responseID = ""
+	select {
+	case <-s.frames:
+	default:
+	}
 	s.mu.Unlock()
 }
 
@@ -82,6 +88,11 @@ func (s *responsesLocalInterrupt) stopClaims() {
 	}
 	s.mu.Lock()
 	s.active = false
+	s.responseID = ""
+	select {
+	case <-s.frames:
+	default:
+	}
 	s.mu.Unlock()
 }
 
@@ -106,16 +117,22 @@ func (s *responsesLocalInterrupt) isActive() bool {
 	return s.active
 }
 
-// deliver claims a frame only if it is actually retained: a full queue
-// rejects so the reader answers the frame itself instead of the client
-// waiting for an answer that only ever addresses the first claim.
+func (s *responsesLocalInterrupt) setResponseID(responseID string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.responseID = strings.TrimSpace(responseID)
+	s.mu.Unlock()
+}
+
 func (s *responsesLocalInterrupt) deliver(payload []byte) bool {
 	if s == nil {
 		return false
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.active || s.wsTurnActive {
+	if !s.active || s.wsTurnActive || s.responseID == "" || strings.TrimSpace(gjson.GetBytes(payload, "response_id").String()) != s.responseID {
 		return false
 	}
 	select {
