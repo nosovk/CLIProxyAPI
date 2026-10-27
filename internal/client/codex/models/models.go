@@ -143,6 +143,8 @@ func buildCodexClientModelsWithToolCapabilities(models []map[string]any, provide
 			applyCodexClientVisibilityOverride(entry, id)
 			if optimizeMultiAgentV2 {
 				entry["multi_agent_version"] = "v2"
+			} else {
+				delete(entry, "multi_agent_version")
 			}
 			applyCodexClientDevinDisplayName(entry, id, model, providersForModel)
 			applyCodexClientApplyPatchCapability(entry, id, applyPatchCapabilityForModel)
@@ -701,6 +703,8 @@ func applyCodexClientModelMetadata(entry map[string]any, id string, model map[st
 	entry["prefer_websockets"] = false
 	if optimizeMultiAgentV2 {
 		entry["multi_agent_version"] = "v2"
+	} else if stringModelValue(entry, "multi_agent_version") == "v2" {
+		delete(entry, "multi_agent_version")
 	}
 	entry["service_tiers"] = []any{}
 	nullCodexClientRequiredOptions(entry)
