@@ -46,10 +46,6 @@ func TestCodexClientModelsResponseMultiAgentV2FollowsConfig(t *testing.T) {
 			if entry == nil {
 				t.Fatalf("missing synthesized model %q", modelID)
 			}
-			// The synthesized model inherits multi_agent_version from the
-			// catalog's default template, which currently carries "v2";
-			// runtime code preserves it when the opt-in is disabled and
-			// rewrites it to "v2" when enabled.
 			value, exists := entry["multi_agent_version"]
 			if tt.enabled {
 				if !exists || value != "v2" {
@@ -57,8 +53,8 @@ func TestCodexClientModelsResponseMultiAgentV2FollowsConfig(t *testing.T) {
 				}
 				return
 			}
-			if !exists || value != "v2" {
-				t.Fatalf("multi_agent_version = %#v, want preserved template value v2", value)
+			if exists {
+				t.Fatalf("multi_agent_version = %#v, want omitted", value)
 			}
 		})
 	}
