@@ -63,10 +63,6 @@ func (s *responsesLocalInterrupt) reactivate() {
 	s.mu.Lock()
 	s.active = true
 	s.responseID = ""
-	select {
-	case <-s.frames:
-	default:
-	}
 	s.mu.Unlock()
 }
 
@@ -89,10 +85,6 @@ func (s *responsesLocalInterrupt) stopClaims() {
 	s.mu.Lock()
 	s.active = false
 	s.responseID = ""
-	select {
-	case <-s.frames:
-	default:
-	}
 	s.mu.Unlock()
 }
 
@@ -132,7 +124,10 @@ func (s *responsesLocalInterrupt) deliver(payload []byte) bool {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if !s.active || s.wsTurnActive || s.responseID == "" || strings.TrimSpace(gjson.GetBytes(payload, "response_id").String()) != s.responseID {
+	if !s.active || s.wsTurnActive {
+		return false
+	}
+	if s.responseID != "" && strings.TrimSpace(gjson.GetBytes(payload, "response_id").String()) != s.responseID {
 		return false
 	}
 	select {
