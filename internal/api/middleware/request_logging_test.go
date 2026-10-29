@@ -840,7 +840,7 @@ func captureOf(t *testing.T, body []byte, limit int64) (captured, restored []byt
 	if limit != 0 {
 		c.Set("maxRequestBodyBytes", limit)
 	}
-	info, errCapture := captureRequestInfo(c, true)
+	info, errCapture := captureRequestInfo(c, true, "")
 	if errCapture != nil {
 		t.Fatal(errCapture)
 	}
