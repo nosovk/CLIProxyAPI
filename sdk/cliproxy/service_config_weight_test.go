@@ -47,6 +47,30 @@ func TestSessionAffinityLoadAwareRoutingState(t *testing.T) {
 	}
 }
 
+func TestSessionAffinityRespectPriorityRoutingState(t *testing.T) {
+	state := normalizedRoutingRuntimeState(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			SessionAffinityRespectPriority: true,
+		},
+	})
+	if state.sessionAffinityRespectPriority {
+		t.Fatal("respect-priority enabled without session affinity")
+	}
+
+	state = normalizedRoutingRuntimeState(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			SessionAffinity:                true,
+			SessionAffinityRespectPriority: true,
+		},
+	})
+	if !state.sessionAffinityRespectPriority {
+		t.Fatalf("state = %+v, want sessionAffinityRespectPriority true", state)
+	}
+	if state == normalizedRoutingRuntimeState(&internalconfig.Config{Routing: internalconfig.RoutingConfig{SessionAffinity: true}}) {
+		t.Fatal("enabling session-affinity-respect-priority must change the routing state so the selector is rebuilt")
+	}
+}
+
 func TestServiceRejectsInvalidCredentialWeightConfigCommit(t *testing.T) {
 	originalCfg := &internalconfig.Config{}
 	service := &Service{cfg: originalCfg}

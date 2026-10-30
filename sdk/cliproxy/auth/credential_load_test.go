@@ -128,12 +128,16 @@ type loadTrackingExecutor struct {
 	stream       chan cliproxyexecutor.StreamChunk
 	executeLoad  float64
 	executeError error
+	executePanic any
 }
 
 func (e *loadTrackingExecutor) Identifier() string { return "codex" }
 
 func (e *loadTrackingExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
 	e.executeLoad = e.manager.credentialLoad.scores([]*Auth{auth})[0]
+	if e.executePanic != nil {
+		panic(e.executePanic)
+	}
 	if e.executeError != nil {
 		return cliproxyexecutor.Response{}, e.executeError
 	}
@@ -190,6 +194,27 @@ func TestManagerExecuteTracksCredentialLoad(t *testing.T) {
 	_, _ = manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-load-tracking"}, cliproxyexecutor.Options{})
 	if got := manager.credentialLoad.scores([]*Auth{auth})[0]; got <= 0 {
 		t.Fatalf("load after 429 = %v, want rate-limit penalty", got)
+	}
+}
+
+func TestManagerExecuteReleasesCredentialLoadOnPanic(t *testing.T) {
+	manager, executor, auth := setupLoadTrackingManager(t, "codex-load-panic")
+	executor.executePanic = "boom"
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("expected Execute panic")
+			}
+		}()
+		_, _ = manager.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: "gpt-load-tracking"}, cliproxyexecutor.Options{})
+	}()
+
+	if executor.executeLoad != 1 {
+		t.Fatalf("load during Execute = %v, want 1", executor.executeLoad)
+	}
+	if got := manager.credentialLoad.scores([]*Auth{auth})[0]; got != 0 {
+		t.Fatalf("load after recovered Execute panic = %v, want 0", got)
 	}
 }
 

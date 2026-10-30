@@ -498,6 +498,12 @@ type RoutingConfig struct {
 	// loaded credential a candidate may be and still be chosen by the routing strategy.
 	// Default: 0 (always pick among the least loaded). Ignored unless SessionAffinityLoadAware is true.
 	SessionAffinityLoadTolerance int `yaml:"session-affinity-load-tolerance,omitempty" json:"session-affinity-load-tolerance,omitempty"`
+
+	// SessionAffinityRespectPriority only keeps an established session binding while its
+	// credential remains in the highest currently available priority tier, rebinding when
+	// higher-priority credentials recover from cooldown.
+	// Default: false. Ignored when SessionAffinity is false.
+	SessionAffinityRespectPriority bool `yaml:"session-affinity-respect-priority,omitempty" json:"session-affinity-respect-priority,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
