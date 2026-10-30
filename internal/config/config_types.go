@@ -487,6 +487,17 @@ type RoutingConfig struct {
 	//     auth errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
 	// Ignored when SessionAffinity is false.
 	SessionAffinityRebindOn string `yaml:"session-affinity-rebind-on,omitempty" json:"session-affinity-rebind-on,omitempty"`
+
+	// SessionAffinityLoadAware makes new session bindings, failovers, and session-less
+	// requests prefer credentials with the fewest in-flight upstream requests, counting a
+	// recent 429 as extra load. Established bindings stay on their credential so prompt
+	// caches keep hitting. Ignored when SessionAffinity is false.
+	SessionAffinityLoadAware bool `yaml:"session-affinity-load-aware,omitempty" json:"session-affinity-load-aware,omitempty"`
+
+	// SessionAffinityLoadTolerance is how many in-flight requests busier than the least
+	// loaded credential a candidate may be and still be chosen by the routing strategy.
+	// Default: 0 (always pick among the least loaded). Ignored unless SessionAffinityLoadAware is true.
+	SessionAffinityLoadTolerance int `yaml:"session-affinity-load-tolerance,omitempty" json:"session-affinity-load-tolerance,omitempty"`
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

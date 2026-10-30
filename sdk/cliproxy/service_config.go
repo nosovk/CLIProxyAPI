@@ -60,6 +60,8 @@ type routingRuntimeState struct {
 	sessionAffinityTTL       time.Duration
 	sessionAffinitySubagents bool
 	sessionAffinityRebindOn  string
+	loadAware                bool
+	loadTolerance            int
 }
 
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
@@ -96,6 +98,10 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	if state.sessionAffinity && strings.EqualFold(strings.TrimSpace(cfg.Routing.SessionAffinityRebindOn), coreauth.SessionAffinityRebindOnQuota) {
 		state.sessionAffinityRebindOn = coreauth.SessionAffinityRebindOnQuota
 	}
+	if state.sessionAffinity && cfg.Routing.SessionAffinityLoadAware {
+		state.loadAware = true
+		state.loadTolerance = max(cfg.Routing.SessionAffinityLoadTolerance, 0)
+	}
 	return state
 }
 
@@ -118,6 +124,8 @@ func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 			TTL:              state.sessionAffinityTTL,
 			SubagentAffinity: &subagents,
 			RebindOn:         state.sessionAffinityRebindOn,
+			LoadAware:        state.loadAware,
+			LoadTolerance:    float64(state.loadTolerance),
 		})
 	}
 	return selector

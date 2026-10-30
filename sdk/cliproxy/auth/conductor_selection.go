@@ -444,6 +444,7 @@ func (m *Manager) SetSelector(selector Selector) {
 		m.mu.Unlock()
 		return
 	}
+	attachCredentialLoad(selector, m.credentialLoad)
 	m.selector = selector
 	m.mu.Unlock()
 

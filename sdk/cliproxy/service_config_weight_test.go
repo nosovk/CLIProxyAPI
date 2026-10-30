@@ -21,6 +21,32 @@ func TestWeightedRoundRobinRoutingSelector(t *testing.T) {
 	}
 }
 
+func TestSessionAffinityLoadAwareRoutingState(t *testing.T) {
+	state := normalizedRoutingRuntimeState(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			SessionAffinityLoadAware:     true,
+			SessionAffinityLoadTolerance: 2,
+		},
+	})
+	if state.loadAware {
+		t.Fatal("load-aware enabled without session affinity")
+	}
+
+	state = normalizedRoutingRuntimeState(&internalconfig.Config{
+		Routing: internalconfig.RoutingConfig{
+			SessionAffinity:              true,
+			SessionAffinityLoadAware:     true,
+			SessionAffinityLoadTolerance: -3,
+		},
+	})
+	if !state.loadAware || state.loadTolerance != 0 {
+		t.Fatalf("state = %+v, want load-aware with tolerance 0", state)
+	}
+	if state == normalizedRoutingRuntimeState(&internalconfig.Config{Routing: internalconfig.RoutingConfig{SessionAffinity: true}}) {
+		t.Fatal("enabling load-aware routing must change the routing state so the selector is rebuilt")
+	}
+}
+
 func TestServiceRejectsInvalidCredentialWeightConfigCommit(t *testing.T) {
 	originalCfg := &internalconfig.Config{}
 	service := &Service{cfg: originalCfg}

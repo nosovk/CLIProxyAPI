@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	log "github.com/sirupsen/logrus"
@@ -976,6 +977,9 @@ type SessionAffinitySelector struct {
 	matcher           *cliproxysession.MerklePrefixMatcher
 	subagentAffinity  bool
 	rebindOnQuotaOnly bool
+	loadAware         bool
+	loadTolerance     float64
+	load              atomic.Pointer[credentialLoadTracker]
 }
 
 const (
@@ -1107,6 +1111,12 @@ type SessionAffinityConfig struct {
 	TTL              time.Duration
 	SubagentAffinity *bool
 	RebindOn         string
+	// LoadAware makes new bindings and failovers prefer the credentials with the
+	// fewest in-flight requests and recent 429s. Established bindings are kept.
+	LoadAware bool
+	// LoadTolerance is how much busier than the least loaded credential a
+	// candidate may be and still be offered to the fallback selector.
+	LoadTolerance float64
 }
 
 // NewSessionAffinitySelector creates a new session-aware selector.
@@ -1136,7 +1146,24 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 		matcher:           cliproxysession.NewMerklePrefixMatcher(cfg.TTL),
 		subagentAffinity:  subagentAffinity,
 		rebindOnQuotaOnly: rebindOnQuotaOnly,
+		loadAware:         cfg.LoadAware,
+		loadTolerance:     math.Max(cfg.LoadTolerance, 0),
 	}
+}
+
+func (s *SessionAffinitySelector) setCredentialLoad(tracker *credentialLoadTracker) {
+	if s != nil {
+		s.load.Store(tracker)
+	}
+}
+
+// pickFallback delegates to the fallback selector, first narrowing the
+// candidates to the least loaded ones when load awareness is enabled.
+func (s *SessionAffinitySelector) pickFallback(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error) {
+	if s.loadAware {
+		auths = s.load.Load().leastLoaded(auths, s.loadTolerance)
+	}
+	return s.fallback.Pick(ctx, provider, model, opts, auths)
 }
 
 // Trees returns a backward-compatible in-memory session tree store.
@@ -1212,7 +1239,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			return nil, errAvailable
 		}
 		entry.Debugf("session-affinity: no session ID extracted, falling back to default selector | provider=%s model=%s", provider, model)
-		return s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		return s.pickFallback(ctx, provider, model, opts, fallbackAuths)
 	}
 
 	// A single availability pass serves both lookups: the bound credential is validated against
@@ -1266,7 +1293,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 			}
 		}
 		// Cached auth not available, reselect via fallback selector for even distribution
-		auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+		auth, err := s.pickFallback(ctx, provider, model, opts, fallbackAuths)
 		if err != nil {
 			return nil, err
 		}
@@ -1322,7 +1349,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 				}
 			}
 			if !isSubagent && !isFork && s.shouldPreserveBindingWhenUnavailable(ctx, availabilityCandidates, model, cachedAuthID, now) {
-				auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+				auth, err := s.pickFallback(ctx, provider, model, opts, fallbackAuths)
 				if err != nil {
 					return nil, err
 				}
@@ -1336,7 +1363,7 @@ func (s *SessionAffinitySelector) Pick(ctx context.Context, provider, model stri
 		}
 	}
 
-	auth, err := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	auth, err := s.pickFallback(ctx, provider, model, opts, fallbackAuths)
 	if err != nil {
 		return nil, err
 	}
@@ -1433,7 +1460,7 @@ func (s *SessionAffinitySelector) pickLCP(ctx context.Context, provider, model s
 	}
 
 	fallbackAuths := highestPriorityAuths(available)
-	auth, errPick := s.fallback.Pick(ctx, provider, model, opts, fallbackAuths)
+	auth, errPick := s.pickFallback(ctx, provider, model, opts, fallbackAuths)
 	if errPick != nil {
 		return nil, true, errPick
 	}

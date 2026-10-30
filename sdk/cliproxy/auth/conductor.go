@@ -206,6 +206,8 @@ type Manager struct {
 	providerOffsets             map[string]int
 	homeDispatchBundle          atomic.Pointer[HomeDispatchBundle]
 	homeInFlightPublisherConfig atomic.Pointer[HomeInFlightPublisherConfig]
+	// credentialLoad tracks per-credential in-flight requests and recent 429s for load-aware selection.
+	credentialLoad *credentialLoadTracker
 
 	// Retry controls request retry behavior.
 	requestRetry        atomic.Int32
@@ -270,7 +272,9 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		homeSessionSelections: make(map[string]map[homeSessionSelectionKey]*HomeDispatchSelection),
 		providerOffsets:       make(map[string]int),
 		modelPoolOffsets:      make(map[string]int),
+		credentialLoad:        newCredentialLoadTracker(),
 	}
+	attachCredentialLoad(selector, manager.credentialLoad)
 	// atomic.Value requires non-nil initial value.
 	manager.runtimeConfig.Store(&internalconfig.Config{})
 	manager.apiKeyModelRouting.Store(&apiKeyModelRoutingSnapshot{config: &internalconfig.Config{}})
