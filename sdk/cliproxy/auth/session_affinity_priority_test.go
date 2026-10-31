@@ -768,3 +768,233 @@ func TestManagerExecuteAndStreamRebindOnQuotaEndToEnd(t *testing.T) {
 		})
 	}
 }
+
+func TestManagerSessionAffinityRespectPriorityRebindsWhenHigherPriorityRecovers(t *testing.T) {
+	for _, testCase := range []struct {
+		name           string
+		providerSuffix string
+		pick           func(*Manager, context.Context, string, string, cliproxyexecutor.Options, map[string]struct{}) (*Auth, error)
+	}{
+		{
+			name:           "single provider",
+			providerSuffix: "single",
+			pick: func(manager *Manager, ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, error) {
+				auth, _, errPick := manager.pickNext(ctx, provider, model, opts, tried)
+				return auth, errPick
+			},
+		},
+		{
+			name:           "mixed provider",
+			providerSuffix: "mixed",
+			pick: func(manager *Manager, ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, error) {
+				auth, _, _, errPick := manager.pickNextMixed(ctx, []string{provider}, model, opts, tried)
+				return auth, errPick
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx := context.Background()
+			provider := "respect-priority-" + testCase.providerSuffix
+			model := "respect-priority-model"
+			high1ID := provider + "-sub-1"
+			high2ID := provider + "-sub-2"
+			reserve1ID := provider + "-reserve-1"
+			reserve2ID := provider + "-reserve-2"
+
+			manager := NewManager(nil, nil, nil)
+			affinity := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+				Fallback:        &FillFirstSelector{},
+				TTL:             time.Hour,
+				RebindOn:        SessionAffinityRebindOnQuota,
+				RespectPriority: true,
+			})
+			defer affinity.Stop()
+			manager.SetSelector(affinity)
+			manager.RegisterExecutor(schedulerTestExecutor{provider: provider})
+
+			for _, auth := range []*Auth{
+				{ID: high1ID, Provider: provider, Status: StatusActive, Attributes: map[string]string{"priority": "0"}},
+				{ID: high2ID, Provider: provider, Status: StatusActive, Attributes: map[string]string{"priority": "0"}},
+				{ID: reserve1ID, Provider: provider, Status: StatusActive, Attributes: map[string]string{"priority": "-10"}},
+				{ID: reserve2ID, Provider: provider, Status: StatusActive, Attributes: map[string]string{"priority": "-10"}},
+			} {
+				if _, errRegister := manager.Register(WithSkipPersist(ctx), auth); errRegister != nil {
+					t.Fatalf("Register(%s): %v", auth.ID, errRegister)
+				}
+				registry.GetGlobalRegistry().RegisterClient(auth.ID, provider, []*registry.ModelInfo{{ID: model}})
+				t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(auth.ID) })
+			}
+
+			makeOpts := func() cliproxyexecutor.Options {
+				return cliproxyexecutor.Options{
+					Headers: http.Header{"Session-Id": []string{"session-respect-priority"}},
+				}
+			}
+
+			// 1. Cold session binds to high1 (priority 0).
+			opts1 := makeOpts()
+			got1, errPick := testCase.pick(manager, ctx, provider, model, opts1, nil)
+			if errPick != nil || got1 == nil || got1.ID != high1ID {
+				t.Fatalf("turn 1 pick = %v (err=%v), want %q", got1, errPick, high1ID)
+			}
+			manager.MarkResult(ctx, Result{AuthID: high1ID, Provider: provider, Model: model, Success: true, Options: opts1})
+
+			// 2. Transient 502 on high1 while high2 is in 429 cooldown -> fails over to reserve1 without rebinding,
+			//    and returns to high1 once high1's transient cooldown expires.
+			optsHigh2Quota := cliproxyexecutor.Options{Headers: http.Header{"Session-Id": []string{"other-session"}}}
+			manager.MarkResult(ctx, Result{
+				AuthID:   high2ID,
+				Provider: provider,
+				Model:    model,
+				Success:  false,
+				Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "429 quota"},
+				Options:  optsHigh2Quota,
+			})
+			opts2 := makeOpts()
+			manager.MarkResult(ctx, Result{
+				AuthID:   high1ID,
+				Provider: provider,
+				Model:    model,
+				Success:  false,
+				Error:    &Error{HTTPStatus: http.StatusBadGateway, Message: "502 transient"},
+				Options:  opts2,
+			})
+			opts2Failover := makeOpts()
+			got2Failover, errPick := testCase.pick(manager, ctx, provider, model, opts2Failover, map[string]struct{}{high1ID: {}})
+			if errPick != nil || got2Failover == nil || got2Failover.ID != reserve1ID {
+				t.Fatalf("turn 2 transient failover pick = %v (err=%v), want %q", got2Failover, errPick, reserve1ID)
+			}
+			manager.MarkResult(ctx, Result{AuthID: reserve1ID, Provider: provider, Model: model, Success: true, Options: opts2Failover})
+
+			expireSessionAffinityPriorityModelCooldown(t, manager, high1ID, model)
+			expireSessionAffinityPriorityModelCooldown(t, manager, high2ID, model)
+			opts3 := makeOpts()
+			got3, errPick := testCase.pick(manager, ctx, provider, model, opts3, nil)
+			if errPick != nil || got3 == nil || got3.ID != high1ID {
+				t.Fatalf("turn 3 after transient recovery = %v (err=%v), want %q", got3, errPick, high1ID)
+			}
+			manager.MarkResult(ctx, Result{AuthID: high1ID, Provider: provider, Model: model, Success: true, Options: opts3})
+
+			// 3. Quota 429 on both high1 and high2 -> rebinds session to reserve1 (priority -10).
+			opts4 := makeOpts()
+			manager.MarkResult(ctx, Result{
+				AuthID:   high1ID,
+				Provider: provider,
+				Model:    model,
+				Success:  false,
+				Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "429 quota"},
+				Options:  opts4,
+			})
+			opts4Attempt2 := makeOpts()
+			got4Attempt2, errPick := testCase.pick(manager, ctx, provider, model, opts4Attempt2, map[string]struct{}{high1ID: {}})
+			if errPick != nil || got4Attempt2 == nil || got4Attempt2.ID != high2ID {
+				t.Fatalf("turn 4 attempt 2 pick = %v (err=%v), want %q", got4Attempt2, errPick, high2ID)
+			}
+			manager.MarkResult(ctx, Result{
+				AuthID:   high2ID,
+				Provider: provider,
+				Model:    model,
+				Success:  false,
+				Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "429 quota"},
+				Options:  opts4Attempt2,
+			})
+			opts4Attempt3 := makeOpts()
+			got4Attempt3, errPick := testCase.pick(manager, ctx, provider, model, opts4Attempt3, map[string]struct{}{high1ID: {}, high2ID: {}})
+			if errPick != nil || got4Attempt3 == nil || got4Attempt3.ID != reserve1ID {
+				t.Fatalf("turn 4 reserve failover pick = %v (err=%v), want %q", got4Attempt3, errPick, reserve1ID)
+			}
+			manager.MarkResult(ctx, Result{AuthID: reserve1ID, Provider: provider, Model: model, Success: true, Options: opts4Attempt3})
+
+			// While subscriptions remain in cooldown, the session stays sticky on reserve1.
+			opts5 := makeOpts()
+			got5, errPick := testCase.pick(manager, ctx, provider, model, opts5, nil)
+			if errPick != nil || got5 == nil || got5.ID != reserve1ID {
+				t.Fatalf("turn 5 while subscriptions cooling = %v (err=%v), want sticky %q", got5, errPick, reserve1ID)
+			}
+			manager.MarkResult(ctx, Result{AuthID: reserve1ID, Provider: provider, Model: model, Success: true, Options: opts5})
+
+			// 4. high2 (priority 0) recovers -> session immediately leaves reserve1 and rebinds to high2.
+			expireSessionAffinityPriorityModelCooldown(t, manager, high2ID, model)
+			opts6 := makeOpts()
+			got6, errPick := testCase.pick(manager, ctx, provider, model, opts6, nil)
+			if errPick != nil || got6 == nil || got6.ID != high2ID {
+				t.Fatalf("turn 6 after high2 recovery = %v (err=%v), want %q", got6, errPick, high2ID)
+			}
+			manager.MarkResult(ctx, Result{AuthID: high2ID, Provider: provider, Model: model, Success: true, Options: opts6})
+
+			// 5. high1 (also priority 0, earlier in FillFirst order) recovers -> session stays sticky on high2!
+			expireSessionAffinityPriorityModelCooldown(t, manager, high1ID, model)
+			opts7 := makeOpts()
+			got7, errPick := testCase.pick(manager, ctx, provider, model, opts7, nil)
+			if errPick != nil || got7 == nil || got7.ID != high2ID {
+				t.Fatalf("turn 7 after high1 recovery = %v (err=%v), want sticky %q within priority 0", got7, errPick, high2ID)
+			}
+		})
+	}
+}
+
+func TestSessionAffinitySelectorRespectPriorityLCPRebindsWhenHigherPriorityRecovers(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback:        &FillFirstSelector{},
+		TTL:             time.Hour,
+		RebindOn:        SessionAffinityRebindOnQuota,
+		RespectPriority: true,
+	})
+	defer selector.Stop()
+
+	high1 := &Auth{ID: "auth-high-1", Status: StatusActive, Attributes: map[string]string{"priority": "0"}}
+	high2 := &Auth{ID: "auth-high-2", Status: StatusActive, Attributes: map[string]string{"priority": "0"}}
+	reserve := &Auth{ID: "auth-reserve", Status: StatusActive, Attributes: map[string]string{"priority": "-10"}}
+
+	makeTurnOpts := func(payload string) cliproxyexecutor.Options {
+		return cliproxyexecutor.Options{
+			SourceFormat:    sdktranslator.FormatOpenAI,
+			OriginalRequest: []byte(payload),
+			Metadata: map[string]any{
+				cliproxyexecutor.CallerScopeMetadataKey: "caller-lcp-respect-priority",
+			},
+		}
+	}
+
+	// Turn 1 starts while both priority-0 credentials are in 429 cooldown -> binds to reserve (-10).
+	high1Cooling := &Auth{
+		ID:             high1.ID,
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: time.Now().Add(time.Minute),
+		LastError:      &Error{HTTPStatus: http.StatusTooManyRequests, Message: "429"},
+		Attributes:     map[string]string{"priority": "0"},
+	}
+	high2Cooling := &Auth{
+		ID:             high2.ID,
+		Status:         StatusError,
+		Unavailable:    true,
+		NextRetryAfter: time.Now().Add(time.Minute),
+		LastError:      &Error{HTTPStatus: http.StatusTooManyRequests, Message: "429"},
+		Attributes:     map[string]string{"priority": "0"},
+	}
+	turn1 := makeTurnOpts(`{"messages":[{"role":"user","content":"turn 1 on reserve"}]}`)
+	got1, err1 := selector.Pick(ctx, "openai", "gpt-5", turn1, []*Auth{high1Cooling, high2Cooling, reserve})
+	if err1 != nil || got1 == nil || got1.ID != reserve.ID {
+		t.Fatalf("turn 1 Pick() = %v (err=%v), want %q", got1, err1, reserve.ID)
+	}
+	selector.OnResult(Result{AuthID: reserve.ID, Provider: "openai", Model: "gpt-5", Options: turn1, Success: true})
+
+	// Turn 2: high2 recovers -> LCP match on reserve (-10) is superseded and rebound to high2 (0).
+	turn2 := makeTurnOpts(`{"messages":[{"role":"user","content":"turn 1 on reserve"},{"role":"assistant","content":"ok"},{"role":"user","content":"turn 2 after recovery"}]}`)
+	got2, err2 := selector.Pick(ctx, "openai", "gpt-5", turn2, []*Auth{high1Cooling, high2, reserve})
+	if err2 != nil || got2 == nil || got2.ID != high2.ID {
+		t.Fatalf("turn 2 Pick() = %v (err=%v), want %q", got2, err2, high2.ID)
+	}
+	selector.OnResult(Result{AuthID: high2.ID, Provider: "openai", Model: "gpt-5", Options: turn2, Success: true})
+
+	// Turn 3: high1 also recovers -> session stays sticky on high2 within priority 0.
+	turn3 := makeTurnOpts(`{"messages":[{"role":"user","content":"turn 1 on reserve"},{"role":"assistant","content":"ok"},{"role":"user","content":"turn 2 after recovery"},{"role":"assistant","content":"ok2"},{"role":"user","content":"turn 3 stays sticky"}]}`)
+	got3, err3 := selector.Pick(ctx, "openai", "gpt-5", turn3, []*Auth{high1, high2, reserve})
+	if err3 != nil || got3 == nil || got3.ID != high2.ID {
+		t.Fatalf("turn 3 Pick() = %v (err=%v), want sticky %q", got3, err3, high2.ID)
+	}
+}
