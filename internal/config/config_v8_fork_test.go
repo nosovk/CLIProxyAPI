@@ -22,12 +22,15 @@ credential-pools:
   default:
     codex:
       - codex-account-1
+    antigravity: []
   paperclip:
     claude:
       - claude-paperclip
     codex:
       - codex-account-1
       - codex-account-paperclip
+    antigravity:
+      - antigravity-paperclip.json
 api-key-pools:
   "sk-paperclip": paperclip
   "*": default
@@ -43,6 +46,12 @@ func assertForkSettings(t *testing.T, cfg *Config) {
 	}
 	if len(cfg.CredentialPools) != 2 || len(cfg.CredentialPools["paperclip"].Codex) != 2 || len(cfg.CredentialPools["paperclip"].Claude) != 1 {
 		t.Fatalf("credential-pools lost: %+v", cfg.CredentialPools)
+	}
+	if got := cfg.CredentialPools["paperclip"].Antigravity; len(got) != 1 || got[0] != "antigravity-paperclip.json" {
+		t.Fatalf("Antigravity allowlist lost: %v", got)
+	}
+	if got := cfg.CredentialPools["default"].Antigravity; got == nil || len(got) != 0 {
+		t.Fatalf("explicit Antigravity deny-all list lost: %v", got)
 	}
 	if cfg.APIKeyPools["sk-paperclip"] != "paperclip" || cfg.APIKeyPools["*"] != "default" {
 		t.Fatalf("api-key-pools lost: %+v", cfg.APIKeyPools)

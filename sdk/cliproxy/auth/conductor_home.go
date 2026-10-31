@@ -1355,6 +1355,7 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 	}
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
 	selectionModel := authSelectionModelFromOptions(opts, routeModel)
+	eligibility := authSelectionEligibilityForRequest(ctx, opts)
 	var candidates []creditsCandidateEntry
 	m.mu.RLock()
 	if affinity, ok := m.selector.(*SessionAffinitySelector); ok && affinity != nil && affinity.rebindOnNever {
@@ -1374,6 +1375,9 @@ func (m *Manager) findAllAntigravityCreditsCandidateAuths(ctx context.Context, r
 			continue
 		}
 		if !strings.EqualFold(strings.TrimSpace(auth.Provider), "antigravity") {
+			continue
+		}
+		if !eligibility.allows(auth) {
 			continue
 		}
 		if !strings.Contains(strings.ToLower(strings.TrimSpace(routeModel)), "claude") {
