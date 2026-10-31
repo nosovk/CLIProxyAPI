@@ -293,7 +293,7 @@ func mergeNodePreserve(dst, src *yaml.Node, path ...[]string) {
 		}
 	case yaml.SequenceNode:
 		// Preserve explicit null style if dst was null and src is empty sequence
-		if dst.Kind == yaml.ScalarNode && dst.Tag == "!!null" && len(src.Content) == 0 {
+		if dst.Kind == yaml.ScalarNode && dst.Tag == "!!null" && len(src.Content) == 0 && !isCredentialPoolsPath(currentPath) {
 			// Keep as null to preserve original style
 			return
 		}
@@ -383,7 +383,7 @@ func appendPath(path []string, key string) []string {
 // never carried it: pruning drops those zero-valued sub-keys. No management
 // endpoint mutates ProxyConnectionPool, so that path is reachable only from code.
 func isKnownDefaultValue(path []string, node *yaml.Node) bool {
-	if isPluginConfigsSubtreePath(path) {
+	if isPluginConfigsSubtreePath(path) || isCredentialPoolsPath(path) {
 		return false
 	}
 	if len(path) == 1 && path[0] == "plugins" && node != nil && node.Kind == yaml.MappingNode {
@@ -464,7 +464,7 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 // pruneKnownDefaultsInNewNode removes default-valued descendants from a new node
 // before it is appended into the destination YAML tree.
 func pruneKnownDefaultsInNewNode(path []string, node *yaml.Node) {
-	if node == nil || isPluginConfigsSubtreePath(path) {
+	if node == nil || isPluginConfigsSubtreePath(path) || isCredentialPoolsPath(path) {
 		return
 	}
 
@@ -856,9 +856,8 @@ func pruneMissingMapKeys(dstMap, srcMap *yaml.Node) {
 }
 
 // shouldPruneNestedMappingKeys reports whether keys missing from src should be pruned from dst.
-// This is strictly scoped to credential-nested mappings such as "cloak" and "headers" under
-// known credential sequence paths to prevent stale deleted keys from persisting while leaving
-// all other mappings and root sections unaffected.
+// This is scoped to credential pools and credential-nested mappings such as "cloak"
+// and "headers", so removed access policies and credential options do not persist.
 //
 // Credential connection-pool blocks stay out of this list on purpose. Pruning only runs while
 // merging a document from an in-memory Config, and a removed pool sub-key can mean either
@@ -866,6 +865,9 @@ func pruneMissingMapKeys(dstMap, srcMap *yaml.Node) {
 // change pooling for a credential. Hand-edited files and v8 management saves therefore keep a
 // sub-key until the whole block is removed.
 func shouldPruneNestedMappingKeys(path []string) bool {
+	if isCredentialPoolsPath(path) {
+		return true
+	}
 	if len(path) < 2 {
 		return false
 	}
@@ -879,6 +881,12 @@ func shouldPruneNestedMappingKeys(path []string) bool {
 	default:
 		return false
 	}
+}
+
+// Pool entries are explicit access policy, not defaults. In particular, [] denies
+// all credentials while an omitted (or null) provider stays unrestricted.
+func isCredentialPoolsPath(path []string) bool {
+	return len(path) > 0 && path[0] == "credential-pools"
 }
 
 // NormalizeCollectionNodeStyles forces YAML collections to use block notation, keeping
