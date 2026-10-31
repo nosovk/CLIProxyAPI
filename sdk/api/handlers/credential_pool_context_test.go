@@ -13,7 +13,7 @@ import (
 )
 
 func TestGetContextWithCancelEnforcesRequestCredentialPool(t *testing.T) {
-	for _, provider := range []string{"claude", "codex"} {
+	for _, provider := range []string{"claude", "codex", "antigravity"} {
 		t.Run(provider, func(t *testing.T) {
 			model := "pool-context-" + provider
 			called := false
@@ -24,6 +24,12 @@ func TestGetContextWithCancelEnforcesRequestCredentialPool(t *testing.T) {
 					called = true
 					return coreexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
 				},
+				stream: func(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+					called = true
+					chunks := make(chan coreexecutor.StreamChunk)
+					close(chunks)
+					return &coreexecutor.StreamResult{Chunks: chunks}, nil
+				},
 			})
 			a := &coreauth.Auth{ID: "foreign-reserve-" + provider, Provider: provider, Status: coreauth.StatusActive}
 			if _, err := manager.Register(context.Background(), a); err != nil {
@@ -31,7 +37,7 @@ func TestGetContextWithCancelEnforcesRequestCredentialPool(t *testing.T) {
 			}
 			registry.GetGlobalRegistry().RegisterClient(a.ID, provider, []*registry.ModelInfo{{ID: model}})
 			t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(a.ID) })
-			pool := &coreauth.ResolvedCredentialPool{Name: "paperclip", Claude: []string{"subscription-only"}, Codex: []string{"subscription-only"}}
+			pool := &coreauth.ResolvedCredentialPool{Name: "paperclip", Claude: []string{"subscription-only"}, Codex: []string{"subscription-only"}, Antigravity: []string{"subscription-only"}}
 			c, _ := gin.CreateTestContext(httptest.NewRecorder())
 			c.Request = httptest.NewRequest("POST", "/v1/chat/completions", nil).WithContext(coreauth.WithCredentialPool(context.Background(), pool))
 			h := NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
@@ -40,6 +46,10 @@ func TestGetContextWithCancelEnforcesRequestCredentialPool(t *testing.T) {
 			_, errMsg := h.ExecuteModel(ctx, ModelExecutionRequest{EntryProtocol: "openai", ExitProtocol: "openai", Model: model, Body: []byte(`{}`), ForcedProvider: provider})
 			if called || errMsg == nil {
 				t.Fatal("request pool was lost: foreign reserve executed")
+			}
+			_, errMsg = h.ExecuteModelStream(ctx, ModelExecutionRequest{EntryProtocol: "openai", ExitProtocol: "openai", Model: model, Body: []byte(`{}`), ForcedProvider: provider})
+			if called || errMsg == nil {
+				t.Fatal("streaming request pool was lost: foreign reserve executed")
 			}
 		})
 	}

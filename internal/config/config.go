@@ -213,7 +213,7 @@ type Config struct {
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
-	// CredentialPools defines named sets of allowed upstream Claude/Codex credential
+	// CredentialPools defines named sets of allowed upstream Claude/Codex/Antigravity credential
 	// identifiers (see CredentialPool). A provider omitted from a pool entry stays fully
 	// unrestricted for keys resolved to that pool (e.g. a pool with only "codex:" leaves
 	// Claude, Gemini, and every other provider shared across every downstream key).

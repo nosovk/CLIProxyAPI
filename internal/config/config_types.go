@@ -1084,8 +1084,8 @@ func (m OpenAICompatibilityModel) GetUseMaxCompletionTokens() bool { return m.Us
 
 func (m OpenAICompatibilityModel) GetThinking() *registry.ThinkingSupport { return m.Thinking }
 
-// CredentialPool names a set of upstream Claude and/or Codex credential identifiers
-// that a downstream API key is allowed to be routed to. Each entry (claude/codex) is
+// CredentialPool names a set of upstream Claude, Codex, or Antigravity credential identifiers
+// that a downstream API key is allowed to be routed to. Each provider entry is
 // matched against a credential's auth file name (with or without the .json extension),
 // its configured label, or its auth ID.
 //
@@ -1101,4 +1101,6 @@ type CredentialPool struct {
 	Claude []string `yaml:"claude,omitempty" json:"claude,omitempty"`
 	// Codex lists the allowed Codex credential identifiers for this pool.
 	Codex []string `yaml:"codex,omitempty" json:"codex,omitempty"`
+	// Antigravity lists the allowed Antigravity credential identifiers for this pool.
+	Antigravity []string `yaml:"antigravity,omitempty" json:"antigravity,omitempty"`
 }
