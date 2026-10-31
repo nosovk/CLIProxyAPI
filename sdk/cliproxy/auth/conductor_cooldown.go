@@ -1505,6 +1505,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 		}
 	}
 	modelKey := canonicalModelKey(result.Model)
+	if m != nil {
+		m.credentialLoad.observeResult(result)
+	}
 
 	var authSnapshot *Auth
 	cooldownStateChanged := false

@@ -745,6 +745,7 @@ func (m *Manager) SetSelector(selector Selector) {
 		m.mu.Unlock()
 		return
 	}
+	attachCredentialLoad(selector, m.credentialLoad)
 	m.selector = selector
 	m.mu.Unlock()
 
@@ -1000,7 +1001,9 @@ func selectorContextForAvailableAuths(ctx context.Context, selector Selector, ro
 	return context.WithValue(ctx, prevalidatedAuthCandidatesKey{}, true)
 }
 
-func (m *Manager) transientlyUnavailableSessionAffinityAuthIDs(ctx context.Context, selector Selector, affinityCandidates []*Auth, routeModel string, now time.Time, clientHeaders ...http.Header) map[string]struct{} {
+// transientlyUnavailableSessionAffinityAuthIDs collects candidate auth IDs (mapped to their
+// configured priority) whose current unavailability is transient rather than a quota or auth block.
+func (m *Manager) transientlyUnavailableSessionAffinityAuthIDs(ctx context.Context, selector Selector, affinityCandidates []*Auth, routeModel string, now time.Time, clientHeaders ...http.Header) map[string]int {
 	affinity, ok := selector.(*SessionAffinitySelector)
 	if !ok || affinity == nil || (!affinity.rebindOnQuotaOnly && !affinity.rebindOnNever) || len(affinityCandidates) == 0 {
 		return nil
@@ -1008,7 +1011,7 @@ func (m *Manager) transientlyUnavailableSessionAffinityAuthIDs(ctx context.Conte
 	if _, weighted := affinity.fallback.(*WeightedRoundRobinSelector); weighted {
 		affinityCandidates = positiveWeightAuths(affinityCandidates)
 	}
-	var authIDs map[string]struct{}
+	var authIDs map[string]int
 	for _, candidate := range affinityCandidates {
 		if candidate == nil || candidate.ID == "" {
 			continue
@@ -1016,9 +1019,9 @@ func (m *Manager) transientlyUnavailableSessionAffinityAuthIDs(ctx context.Conte
 		checkModel := m.selectionModelForAuth(candidate, routeModel)
 		if !isAuthBlockedByQuotaOrAuthForModelForRequest(ctx, candidate, checkModel, now, clientHeaders...) {
 			if authIDs == nil {
-				authIDs = make(map[string]struct{}, len(affinityCandidates))
+				authIDs = make(map[string]int, len(affinityCandidates))
 			}
-			authIDs[candidate.ID] = struct{}{}
+			authIDs[candidate.ID] = authPriority(candidate)
 		}
 	}
 	return authIDs
