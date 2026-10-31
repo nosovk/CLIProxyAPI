@@ -8,9 +8,10 @@ import (
 )
 
 type ResolvedCredentialPool struct {
-	Name   string
-	Claude []string
-	Codex  []string
+	Name        string
+	Claude      []string
+	Codex       []string
+	Antigravity []string
 }
 
 type credentialPoolContextKey struct{}
@@ -56,9 +57,9 @@ func ResolveCredentialPoolForAPIKey(cfg *internalconfig.Config, apiKey string) *
 	}
 	entry, ok := cfg.CredentialPools[poolName]
 	if !ok {
-		return &ResolvedCredentialPool{Name: poolName, Claude: []string{}, Codex: []string{}}
+		return &ResolvedCredentialPool{Name: poolName, Claude: []string{}, Codex: []string{}, Antigravity: []string{}}
 	}
-	return &ResolvedCredentialPool{Name: poolName, Claude: entry.Claude, Codex: entry.Codex}
+	return &ResolvedCredentialPool{Name: poolName, Claude: entry.Claude, Codex: entry.Codex, Antigravity: entry.Antigravity}
 }
 
 // Allows reports whether auth is usable by the downstream key resolved to this pool.
@@ -80,6 +81,8 @@ func (p *ResolvedCredentialPool) Allows(auth *Auth) bool {
 		allowed = p.Claude
 	case "codex":
 		allowed = p.Codex
+	case "antigravity":
+		allowed = p.Antigravity
 	default:
 		return true
 	}
