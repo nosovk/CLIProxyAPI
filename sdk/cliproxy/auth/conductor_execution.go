@@ -30,6 +30,14 @@ func newUpstreamAttemptContext(ctx context.Context) context.Context {
 	return cliproxyexecutor.WithUpstreamAttemptTracker(ctx)
 }
 
+// executeWithCredentialLoad acquires an in-flight load slot on auth for the
+// duration of executor.Execute and guarantees release even if Execute panics.
+func (m *Manager) executeWithCredentialLoad(ctx context.Context, executor ProviderExecutor, auth *Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	releaseLoad := m.credentialLoad.acquire(auth.ID)
+	defer releaseLoad()
+	return executor.Execute(ctx, auth, req, opts)
+}
+
 func claudeOAuthRequestCancellation(ctx context.Context, auth *Auth, err error) error {
 	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "claude") || !strings.EqualFold(strings.TrimSpace(auth.Attributes["auth_kind"]), "oauth") {
 		return nil
@@ -625,7 +633,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
 			executionSeq := m.nextExecutionSeq()
 			startExec := time.Now()
-			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
+			resp, errExec := m.executeWithCredentialLoad(execCtx, executor, auth, execReq, execOpts)
 			errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 			durationExec := time.Since(startExec)
 			if errExec != nil {
@@ -643,7 +651,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 					execCtx = syncMetadataSessionToContext(execCtx, execOpts.Metadata)
 					executionSeq = m.nextExecutionSeq()
 					startRetry := time.Now()
-					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
+					resp, errExec = m.executeWithCredentialLoad(execCtx, executor, auth, execReq, execOpts)
 					errExec = markUpstreamExecutionAttemptFromContext(execCtx, errExec)
 					durationRetry := time.Since(startRetry)
 					if errExec != nil {

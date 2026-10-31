@@ -204,9 +204,10 @@ routing:
   # followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,
   # execution or derived session identity, and the existing first-message hash fallback.
   # Automatic failover is always enabled when bound auth becomes unavailable.
-  # An established binding outranks credential priority: once a session is bound, that
-  # credential is kept even if a higher-priority credential recovers. Credential priority
-  # still decides cold bindings, requests without a session, and post-failover rebinding.
+  # By default, an established binding outranks credential priority: once a session is bound,
+  # that credential is kept even if a higher-priority credential recovers (set
+  # session-affinity-respect-priority: true to rebind to recovered higher-priority credentials).
+  # Credential priority always decides cold bindings, requests without a session, and failovers.
   session-affinity: false # default: false
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
@@ -228,6 +229,19 @@ routing:
   #     errors (429, 401/402/403, 404/model support, invalid_grant) rebind as normal.
   # Ignored when routing.session-affinity is false.
   session-affinity-rebind-on: "any"
+  # When true, new session bindings, failovers, and session-less requests go to the credential
+  # with the fewest in-flight upstream requests (a recent 429 counts as extra load); the routing
+  # strategy only breaks ties. Established bindings never move, so prompt caches keep hitting.
+  # Ignored when routing.session-affinity is false.
+  session-affinity-load-aware: false
+  # How many in-flight requests busier than the least loaded credential a candidate may be and
+  # still be chosen by the routing strategy. 0 always picks among the least loaded.
+  session-affinity-load-tolerance: 0
+  # When true, an established session binding is only kept while its credential remains in the
+  # highest currently available priority tier; once a higher-priority credential recovers from
+  # cooldown, the session rebinds to the higher tier instead of sticking to a lower-priority
+  # reserve. Ignored when routing.session-affinity is false.
+  session-affinity-respect-priority: false
 
   # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
   force-model-prefix: false
