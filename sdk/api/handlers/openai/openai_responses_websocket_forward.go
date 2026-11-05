@@ -252,7 +252,7 @@ func (h *OpenAIResponsesAPIHandler) forwardResponsesWebsocket(
 					turnEnded = false
 					if opts.localInterrupt != nil {
 						opts.localInterrupt.reactivate()
-						opts.localInterrupt.setResponseID(gjson.GetBytes(payloads[i], "response.id").String())
+						opts.localInterrupt.setResponseID(ojson.GetBytesNoCopy(payloads[i], "response.id").String())
 					}
 					outputItemsByIndex = make(map[int64][]byte)
 					outputItemsFallback = nil

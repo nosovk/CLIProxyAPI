@@ -127,7 +127,7 @@ func (s *responsesLocalInterrupt) deliver(payload []byte) bool {
 	if !s.active || s.wsTurnActive {
 		return false
 	}
-	if s.responseID != "" && strings.TrimSpace(gjson.GetBytes(payload, "response_id").String()) != s.responseID {
+	if s.responseID != "" && strings.TrimSpace(ojson.GetBytesNoCopy(payload, "response_id").String()) != s.responseID {
 		return false
 	}
 	select {

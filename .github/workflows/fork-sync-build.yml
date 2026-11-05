@@ -115,8 +115,8 @@ jobs:
           # also lack rights on some forks. Fall back to an unlabelled issue rather
           # than losing the report, but never silently.
           LABEL_ARGS=(--label upstream-sync-conflict)
-          if ! gh label list --json name --jq '.[].name' | grep -qx upstream-sync-conflict; then
-            if ! gh label create upstream-sync-conflict --color B60205 --description "Nightly upstream rebase failed"; then
+          if ! gh label list --repo "$GITHUB_REPOSITORY" --json name --jq '.[].name' | grep -qx upstream-sync-conflict; then
+            if ! gh label create upstream-sync-conflict --repo "$GITHUB_REPOSITORY" --color B60205 --description "Nightly upstream rebase failed"; then
               echo "::warning::could not create label upstream-sync-conflict; filing issue without it"
               LABEL_ARGS=()
             fi
@@ -148,12 +148,12 @@ jobs:
           \`\`\`
           EOF
           )
-          EXISTING=$(gh issue list --label upstream-sync-conflict --state open --json number --jq '.[0].number')
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --label upstream-sync-conflict --state open --json number --jq '.[0].number')
           if [ -n "$EXISTING" ]; then
-            gh issue edit "$EXISTING" --title "$TITLE" --body "$BODY"
-            gh issue comment "$EXISTING" --body "Still conflicting as of upstream \`${UPSTREAM_SHA}\`: ${RUN_URL}"
+            gh issue edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "Still conflicting as of upstream \`${UPSTREAM_SHA}\`: ${RUN_URL}"
           else
-            gh issue create --title "$TITLE" --body "$BODY" "${LABEL_ARGS[@]}"
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY" "${LABEL_ARGS[@]}"
           fi
 
       - name: Close stale conflict issue
@@ -161,8 +161,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          for n in $(gh issue list --label upstream-sync-conflict --state open --json number --jq '.[].number'); do
-            gh issue close "$n" --comment "Rebase onto upstream/${{ env.UPSTREAM_BRANCH }} succeeded in ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}."
+          for n in $(gh issue list --repo "$GITHUB_REPOSITORY" --label upstream-sync-conflict --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --comment "Rebase onto upstream/${{ env.UPSTREAM_BRANCH }} succeeded in ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}."
           done
 
       - name: Run Go Tests
