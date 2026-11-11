@@ -96,13 +96,13 @@ jobs:
             git rebase --abort || true
             echo "should_build=false" >> $GITHUB_OUTPUT
             echo "conflict=true" >> $GITHUB_OUTPUT
-            exit 0
+            exit 1
           fi
 
           echo "should_build=true" >> $GITHUB_OUTPUT
 
       - name: Open or update conflict issue
-        if: steps.check_rebase.outputs.conflict == 'true'
+        if: failure() && steps.check_rebase.outputs.conflict == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           UPSTREAM_SHA: ${{ steps.check_rebase.outputs.upstream_sha }}

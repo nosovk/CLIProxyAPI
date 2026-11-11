@@ -86,6 +86,31 @@ func TestSessionAffinityLoadAwareKeepsBindingsAndSpreadsNewSessions(t *testing.T
 	}
 }
 
+func TestSessionAffinityLoadAwareWeightedKeepsBindings(t *testing.T) {
+	tracker := newCredentialLoadTracker()
+	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
+		Fallback: &WeightedRoundRobinSelector{}, LoadAware: true,
+	})
+	defer selector.Stop()
+	attachCredentialLoad(selector, tracker)
+	auths := []*Auth{{ID: "auth-a"}, {ID: "auth-b"}}
+	pick := func(session, want string) {
+		t.Helper()
+		opts := cliproxyexecutor.Options{Headers: http.Header{"Session_id": {session}}}
+		picked, errPick := selector.Pick(context.Background(), "codex", "gpt-load", opts, auths)
+		if errPick != nil || picked == nil || picked.ID != want {
+			t.Fatalf("Pick(%q) = %v, %v; want %s", session, picked, errPick, want)
+		}
+	}
+	defer tracker.acquire("auth-a")()
+	pick("sticky", "auth-b")
+	defer tracker.acquire("auth-b")()
+	defer tracker.acquire("auth-b")()
+	pick("sticky", "auth-b")
+	pick("cold", "auth-a")
+	pick("", "auth-a")
+}
+
 func TestSessionAffinityLoadToleranceDefersToFallbackOrder(t *testing.T) {
 	tracker := newCredentialLoadTracker()
 	selector := NewSessionAffinitySelectorWithConfig(SessionAffinityConfig{
