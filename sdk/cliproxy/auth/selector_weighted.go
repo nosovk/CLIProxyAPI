@@ -44,7 +44,10 @@ func (s *SessionAffinitySelector) pickWithAffinityReservation(ctx context.Contex
 		if bound != nil {
 			return bound, nil
 		}
-		return s.fallback.Pick(ctx, provider, model, opts, auths)
+		return s.pickFallback(ctx, provider, model, opts, auths)
+	}
+	if bound == nil && s.loadAware {
+		auths = s.load.Load().leastLoaded(auths, s.loadTolerance)
 	}
 	picked, pending, errPick := weighted.reserveForRequest(ctx, provider, model, opts, auths, bound)
 	*reservation = pending

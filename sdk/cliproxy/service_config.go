@@ -56,13 +56,17 @@ type configCommit struct {
 }
 
 type routingRuntimeState struct {
-	strategy                 string
-	sessionAffinity          bool
-	sessionAffinityTTL       time.Duration
-	sessionAffinitySubagents bool
-	sessionAffinityRebindOn  string
+	strategy                       string
+	sessionAffinity                bool
+	sessionAffinityTTL             time.Duration
+	sessionAffinitySubagents       bool
+	sessionAffinityRebindOn        string
+	sessionAffinityRespectPriority bool
+	loadAware                      bool
+	loadTolerance                  int
 }
 
+// normalizedRoutingRuntimeState extracts a comparable snapshot of routing selector settings from cfg.
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state := routingRuntimeState{
 		strategy:                 "round-robin",
@@ -79,6 +83,8 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 		state.strategy = "weighted-round-robin"
 	case "fill-first", "fillfirst", "ff":
 		state.strategy = "fill-first"
+	case "nearest-reset", "nearestreset", "nr":
+		state.strategy = "nearest-reset"
 	}
 	state.sessionAffinity = cfg.Routing.SessionAffinity
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
@@ -100,9 +106,17 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 			state.sessionAffinityRebindOn = coreauth.SessionAffinityRebindOnNever
 		}
 	}
+	if state.sessionAffinity && cfg.Routing.SessionAffinityRespectPriority {
+		state.sessionAffinityRespectPriority = true
+	}
+	if state.sessionAffinity && cfg.Routing.SessionAffinityLoadAware {
+		state.loadAware = true
+		state.loadTolerance = max(cfg.Routing.SessionAffinityLoadTolerance, 0)
+	}
 	return state
 }
 
+// newRoutingSelector builds the configured base selector wrapped in session affinity when enabled.
 func newRoutingSelector(state routingRuntimeState) coreauth.Selector {
 	return newRoutingSelectorWithExisting(state, nil)
 }
@@ -118,6 +132,8 @@ func newRoutingSelectorWithExisting(state routingRuntimeState, existing coreauth
 		}
 	case "fill-first":
 		selector = &coreauth.FillFirstSelector{}
+	case "nearest-reset":
+		selector = &coreauth.NearestResetSelector{}
 	default:
 		selector = &coreauth.RoundRobinSelector{}
 	}
@@ -128,6 +144,9 @@ func newRoutingSelectorWithExisting(state routingRuntimeState, existing coreauth
 			TTL:              state.sessionAffinityTTL,
 			SubagentAffinity: &subagents,
 			RebindOn:         state.sessionAffinityRebindOn,
+			RespectPriority:  state.sessionAffinityRespectPriority,
+			LoadAware:        state.loadAware,
+			LoadTolerance:    float64(state.loadTolerance),
 		})
 	}
 	return selector

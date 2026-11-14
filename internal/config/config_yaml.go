@@ -902,9 +902,8 @@ func pruneMissingMapKeys(dstMap, srcMap *yaml.Node) {
 }
 
 // shouldPruneNestedMappingKeys reports whether keys missing from src should be pruned from dst.
-// This is strictly scoped to credential-nested mappings such as "cloak" and "headers" under
-// known credential sequence paths to prevent stale deleted keys from persisting while leaving
-// all other mappings and root sections unaffected.
+// This is scoped to credential pools and credential-nested mappings such as "cloak"
+// and "headers", so removed access policies and credential options do not persist.
 //
 // Credential connection-pool blocks stay out of this list on purpose. Pruning only runs while
 // merging a document from an in-memory Config, and a removed pool sub-key can mean either
