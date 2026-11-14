@@ -77,6 +77,9 @@ func buildV8Paths() []configPath {
 		{"github-token", "server.github-token"},
 		{"tls", "server.tls"}, {"shutdown-timeout", "server.shutdown-timeout"}, {"commercial-mode", "server.commercial-mode"}, {"discovery", "server.discovery"}, {"kv-store", "server.kv-store"},
 		{"remote-management", "management"}, {"api-keys", "access.api-keys"},
+		// Fork-only sections: downstream key pools live next to access.api-keys so the
+		// v8 migration carries them over instead of commenting them out as unknown.
+		{"credential-pools", "access.credential-pools"}, {"api-key-pools", "access.api-key-pools"},
 		{"credential-concurrency", "credentials.concurrency"}, {"credential-in-flight", "credentials.in-flight"},
 		{"force-model-prefix", "routing.force-model-prefix"},
 		{"request-retry", "routing.retry.request-retry"}, {"max-retry-credentials", "routing.retry.max-retry-credentials"},
