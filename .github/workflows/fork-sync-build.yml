@@ -1,0 +1,381 @@
+name: Fork Sync and Build
+
+on:
+  schedule:
+    # Run daily at 03:00 UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build and publish Docker image'
+        type: boolean
+        default: false
+      skip_rebase:
+        description: 'Skip upstream rebase and build current branch'
+        type: boolean
+        default: false
+  push:
+    branches:
+      - feature/json-request-logging
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/cli-proxy-api
+  TARGET_BRANCH: feature/json-request-logging
+  UPSTREAM_REPO: https://github.com/router-for-me/CLIProxyAPI.git
+  UPSTREAM_BRANCH: dev
+
+jobs:
+  sync-and-test:
+    if: github.repository == 'nosovk/CLIProxyAPI'
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check_rebase.outputs.should_build }}
+      commit_sha: ${{ steps.get_sha.outputs.commit_sha }}
+      commit_short_sha: ${{ steps.get_sha.outputs.commit_short_sha }}
+    steps:
+      - name: Checkout target branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync and Rebase against Upstream
+        id: check_rebase
+        run: |
+          if [ "${{ github.event_name }}" = "push" ] || [ "${{ github.event.inputs.skip_rebase }}" = "true" ]; then
+            echo "Building the pushed branch without upstream rebase."
+            echo "should_build=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          git remote add upstream ${{ env.UPSTREAM_REPO }} || true
+          git fetch upstream ${{ env.UPSTREAM_BRANCH }}
+
+          BEHIND_COUNT=$(git rev-list --count HEAD..upstream/${{ env.UPSTREAM_BRANCH }})
+          echo "Commits behind upstream/${{ env.UPSTREAM_BRANCH }}: $BEHIND_COUNT"
+
+          if [ "$BEHIND_COUNT" -eq 0 ] && [ "${{ github.event_name }}" = "schedule" ] && [ "${{ github.event.inputs.force_build }}" != "true" ]; then
+            echo "No upstream changes to sync."
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "upstream_sha=$(git rev-parse --short=7 upstream/${{ env.UPSTREAM_BRANCH }})" >> $GITHUB_OUTPUT
+          echo "fork_sha=$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
+
+          echo "Attempting rebase onto upstream/${{ env.UPSTREAM_BRANCH }}..."
+          if ! git rebase upstream/${{ env.UPSTREAM_BRANCH }}; then
+            echo "::error::Rebase conflict detected!"
+            {
+              echo "conflict_files<<EOF"
+              git diff --name-only --diff-filter=U
+              echo "EOF"
+              echo "conflict_commit=$(git log -1 --format='%h %s' REBASE_HEAD 2>/dev/null || echo unknown)"
+            } >> $GITHUB_OUTPUT
+            git rebase --abort || true
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            echo "conflict=true" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "should_build=true" >> $GITHUB_OUTPUT
+
+      - name: Open or update conflict issue
+        if: failure() && steps.check_rebase.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPSTREAM_SHA: ${{ steps.check_rebase.outputs.upstream_sha }}
+          FORK_SHA: ${{ steps.check_rebase.outputs.fork_sha }}
+          CONFLICT_COMMIT: ${{ steps.check_rebase.outputs.conflict_commit }}
+          CONFLICT_FILES: ${{ steps.check_rebase.outputs.conflict_files }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # `gh label create` needs the label to not exist or --force; GITHUB_TOKEN may
+          # also lack rights on some forks. Fall back to an unlabelled issue rather
+          # than losing the report, but never silently.
+          LABEL_ARGS=(--label upstream-sync-conflict)
+          if ! gh label list --repo "$GITHUB_REPOSITORY" --json name --jq '.[].name' | grep -qx upstream-sync-conflict; then
+            if ! gh label create upstream-sync-conflict --repo "$GITHUB_REPOSITORY" --color B60205 --description "Nightly upstream rebase failed"; then
+              echo "::warning::could not create label upstream-sync-conflict; filing issue without it"
+              LABEL_ARGS=()
+            fi
+          fi
+          TITLE="Upstream sync conflict: ${{ env.UPSTREAM_BRANCH }}@${UPSTREAM_SHA} vs fork ${FORK_SHA}"
+          BODY=$(cat <<EOF
+          Nightly rebase of \`${{ env.TARGET_BRANCH }}\` onto \`upstream/${{ env.UPSTREAM_BRANCH }}\` failed.
+
+          | | |
+          |---|---|
+          | Fork HEAD | \`${FORK_SHA}\` |
+          | Upstream HEAD | \`${UPSTREAM_SHA}\` |
+          | First conflicting fork commit | \`${CONFLICT_COMMIT}\` |
+          | Run | ${RUN_URL} |
+
+          Conflicting files:
+          \`\`\`
+          ${CONFLICT_FILES}
+          \`\`\`
+
+          Until this is resolved no new image is published and production stays on the last pinned tag.
+
+          Resolve locally:
+          \`\`\`sh
+          git fetch origin ${{ env.TARGET_BRANCH }} && git checkout ${{ env.TARGET_BRANCH }}
+          git fetch ${{ env.UPSTREAM_REPO }} ${{ env.UPSTREAM_BRANCH }} && git rebase FETCH_HEAD
+          # fix, go build ./... && go test ./..., then:
+          git push --force-with-lease origin ${{ env.TARGET_BRANCH }}
+          \`\`\`
+          EOF
+          )
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --label upstream-sync-conflict --state open --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue edit "$EXISTING" --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY"
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "Still conflicting as of upstream \`${UPSTREAM_SHA}\`: ${RUN_URL}"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY" "${LABEL_ARGS[@]}"
+          fi
+
+      - name: Close stale conflict issue
+        if: steps.check_rebase.outputs.should_build == 'true' && github.event_name != 'push'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for n in $(gh issue list --repo "$GITHUB_REPOSITORY" --label upstream-sync-conflict --state open --json number --jq '.[].number'); do
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --comment "Rebase onto upstream/${{ env.UPSTREAM_BRANCH }} succeeded in ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}."
+          done
+
+      - name: Run Go Tests
+        if: steps.check_rebase.outputs.should_build == 'true'
+        run: |
+          # Upstream does not run its own tests in CI and ships timing-sensitive
+          # websocket tests that flake on shared runners (e.g.
+          # TestWebsocketRetryBindFailureClearsActiveSessionState). Rerun only
+          # the packages that failed once before declaring the build broken.
+          set -o pipefail
+          if go test ./... 2>&1 | tee test.log; then
+            exit 0
+          fi
+          # `go test` prints "FAIL<TAB>pkg<TAB>time" per failed package; match any
+          # whitespace with a POSIX class since grep -E does not understand \s.
+          FAILED=$(grep -E '^FAIL[[:space:]]+[^[:space:]]+' test.log | awk '{print $2}' | sort -u)
+          if [ -z "$FAILED" ]; then
+            echo "::error::go test failed without a package list"; tail -50 test.log; exit 1
+          fi
+          echo "::warning::Retrying failed packages once: $FAILED"
+          # shellcheck disable=SC2086
+          go test -count=1 $FAILED
+
+      - name: Push Rebased Branch to Fork
+        if: steps.check_rebase.outputs.should_build == 'true' && github.event_name != 'push'
+        run: |
+          git push --force-with-lease origin ${{ env.TARGET_BRANCH }}
+
+      - name: Record Commit SHA
+        id: get_sha
+        if: steps.check_rebase.outputs.should_build == 'true'
+        run: |
+          echo "commit_sha=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+          echo "commit_short_sha=$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
+
+  build-and-publish:
+    needs: sync-and-test
+    if: needs.sync-and-test.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ env.TARGET_BRANCH }}
+            type=raw,value=${{ needs.sync-and-test.outputs.commit_short_sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.sync-and-test.outputs.commit_sha }}
+            org.opencontainers.image.version=${{ env.TARGET_BRANCH }}
+          annotations: |
+            org.opencontainers.image.revision=${{ needs.sync-and-test.outputs.commit_sha }}
+            org.opencontainers.image.version=${{ env.TARGET_BRANCH }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: |
+            VERSION=fork-json-logging
+            COMMIT=${{ needs.sync-and-test.outputs.commit_sha }}
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  propose-deploy:
+    needs: [sync-and-test, build-and-publish]
+    if: needs.sync-and-test.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      DEPLOY_REPO: hex-drift/ai-gate
+      DEPLOY_BRANCH: deploy/cli-proxy-api-bump
+      NEW_TAG: ${{ needs.sync-and-test.outputs.commit_short_sha }}
+      NEW_SHA: ${{ needs.sync-and-test.outputs.commit_sha }}
+      GH_TOKEN: ${{ secrets.AI_GATE_PR_TOKEN }}
+    steps:
+      - name: Checkout deploy repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.DEPLOY_REPO }}
+          token: ${{ secrets.AI_GATE_PR_TOKEN }}
+          path: ai-gate
+          fetch-depth: 0
+
+      - name: Checkout fork for changelog
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          path: fork
+          fetch-depth: 0
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump image tag
+        id: bump
+        working-directory: ai-gate
+        run: |
+          OLD_TAG=$(sed -nE 's#^\s*image: ghcr.io/nosovk/cli-proxy-api:([A-Za-z0-9._-]+)\s*$#\1#p' docker-compose.yml | head -1)
+          echo "old_tag=$OLD_TAG" >> $GITHUB_OUTPUT
+          if [ "$OLD_TAG" = "$NEW_TAG" ]; then
+            echo "Already on $NEW_TAG"; echo "changed=false" >> $GITHUB_OUTPUT; exit 0
+          fi
+          sed -i -E "s#^(\s*image: ghcr.io/nosovk/cli-proxy-api:)[A-Za-z0-9._-]+\s*\$#\1${NEW_TAG}#" docker-compose.yml
+          git diff --quiet && { echo "No image line matched"; exit 1; }
+          echo "changed=true" >> $GITHUB_OUTPUT
+
+      - name: Build changelog
+        id: log
+        if: steps.bump.outputs.changed == 'true'
+        working-directory: fork
+        env:
+          OLD_TAG: ${{ steps.bump.outputs.old_tag }}
+        run: |
+          git remote add upstream ${{ env.UPSTREAM_REPO }} || true
+          git fetch -q upstream ${{ env.UPSTREAM_BRANCH }}
+          # Describe what was actually built: the upstream base is the merge-base of
+          # the built commit, not upstream HEAD (push-triggered builds skip the rebase).
+          NEW_BASE=$(git merge-base HEAD upstream/${{ env.UPSTREAM_BRANCH }})
+          UP=${NEW_BASE:0:7}
+          FORK_COMMITS=$(git log --format='- %h %s' "$NEW_BASE..HEAD")
+          UPSTREAM_LAG=$(git rev-list --count "$NEW_BASE..upstream/${{ env.UPSTREAM_BRANCH }}")
+          # The previous tag is a fork SHA that a nightly force-push has usually rewritten
+          # away, so it is not reachable from any ref. Resolve the full SHA from the image
+          # label instead, then fetch that exact object from the fork.
+          OLD_FULL=$(docker buildx imagetools inspect "ghcr.io/nosovk/cli-proxy-api:${OLD_TAG}" --format '{{ index .Image.Config.Labels "org.opencontainers.image.revision" }}' 2>/dev/null || true)
+          [ -z "$OLD_FULL" ] && OLD_FULL="$OLD_TAG"
+          git fetch -q origin "$OLD_FULL" 2>/dev/null || true
+          if git cat-file -e "$OLD_FULL^{commit}" 2>/dev/null; then
+            OLD_BASE=$(git merge-base "$OLD_FULL" upstream/${{ env.UPSTREAM_BRANCH }} 2>/dev/null || true)
+            if [ -n "$OLD_BASE" ]; then
+              UPSTREAM_RANGE="${OLD_BASE:0:7}...${UP}"
+              UPSTREAM_COUNT=$(git rev-list --count "$OLD_BASE..$NEW_BASE")
+              UPSTREAM_LOG=$(git log --format='- %h %s' "$OLD_BASE..$NEW_BASE" | head -60)
+            fi
+          fi
+          {
+            echo "body<<EOF"
+            echo "Automated bump from \`fork-sync-build\`: \`${OLD_TAG}\` → \`${NEW_TAG}\`."
+            echo
+            echo "Image: \`ghcr.io/nosovk/cli-proxy-api:${NEW_TAG}\` (commit \`${NEW_SHA}\`)"
+            echo "Fork run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo
+            echo "### Fork commits on top of upstream/${{ env.UPSTREAM_BRANCH }}@${UP}"
+            echo "${FORK_COMMITS}"
+            echo
+            if [ "$UPSTREAM_LAG" -gt 0 ]; then
+              echo "> Note: upstream/${{ env.UPSTREAM_BRANCH }} is ${UPSTREAM_LAG} commit(s) ahead of this build's base; the next nightly sync will pick them up."
+              echo
+            fi
+            if [ -n "${UPSTREAM_RANGE:-}" ] && [ "${UPSTREAM_COUNT}" -gt 0 ]; then
+              echo "### Upstream changes since previous deploy (${UPSTREAM_COUNT} commits)"
+              echo "https://github.com/router-for-me/CLIProxyAPI/compare/${UPSTREAM_RANGE}"
+              echo
+              echo "${UPSTREAM_LOG}"
+              [ "${UPSTREAM_COUNT}" -gt 60 ] && echo "- … and $((UPSTREAM_COUNT-60)) more"
+            elif [ -n "${UPSTREAM_RANGE:-}" ]; then
+              echo "### Upstream changes since previous deploy"
+              echo "None — same upstream base (\`${UP}\`); only fork commits changed."
+            else
+              echo "### Upstream changes"
+              echo "Previous tag \`${OLD_TAG}\` not found in fork history; see upstream/${{ env.UPSTREAM_BRANCH }} directly."
+            fi
+            echo
+            echo "Merging deploys to production via doco-cd within ~60 s. Review upstream changes before merging."
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Push branch and open/update PR
+        if: steps.bump.outputs.changed == 'true'
+        working-directory: ai-gate
+        env:
+          BODY: ${{ steps.log.outputs.body }}
+          OLD_TAG: ${{ steps.bump.outputs.old_tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$DEPLOY_BRANCH"
+          git add docker-compose.yml
+          git commit -m "deploy: bump cli-proxy-api to ${NEW_TAG}" -m "Automated by nosovk/CLIProxyAPI fork-sync-build. Upstream ${{ env.UPSTREAM_BRANCH }} + fork patches."
+          git push --force origin "$DEPLOY_BRANCH"
+          TITLE="deploy: bump cli-proxy-api ${OLD_TAG} → ${NEW_TAG}"
+          EXISTING=$(gh pr list --repo "$DEPLOY_REPO" --head "$DEPLOY_BRANCH" --state open --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --repo "$DEPLOY_REPO" --title "$TITLE" --body "$BODY"
+            echo "Updated PR #$EXISTING"
+          else
+            gh pr create --repo "$DEPLOY_REPO" --base main --head "$DEPLOY_BRANCH" --title "$TITLE" --body "$BODY"
+          fi
