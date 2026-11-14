@@ -1,0 +1,42 @@
+name: Fork patch checks
+on:
+  pull_request:
+  push:
+    branches: [feature/json-request-logging]
+    paths:
+      - 'scripts/fork-ci/**'
+      - '.github/workflows/fork-*.yml'
+permissions:
+  contents: read
+jobs:
+  ci-contracts:
+    if: github.repository == 'nosovk/CLIProxyAPI'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s scripts/fork-ci -p 'test_*.py' -v
+      - name: Shell syntax and static analysis
+        run: |
+          for script in scripts/fork-ci/*.sh; do bash -n "$script"; done
+          shellcheck scripts/fork-ci/*.sh
+      - uses: docker://rhysd/actionlint:1.7.7
+        with:
+          args: .github/workflows/fork-sync-build.yml .github/workflows/fork-checks.yml
+  go-tests:
+    if: github.repository == 'nosovk/CLIProxyAPI' && github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: |
+          bash scripts/fork-ci/test.sh
+          go vet ./...
+          go build -o "${RUNNER_TEMP}/cli-proxy-api" ./cmd/server
+          go test -race ./sdk/cliproxy/auth ./sdk/api/handlers/openai ./internal/logging ./internal/api/middleware ./internal/util
