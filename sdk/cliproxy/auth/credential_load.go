@@ -78,8 +78,15 @@ func (t *credentialLoadTracker) observeResult(result Result) {
 // decayed rate-limit penalty.
 func (t *credentialLoadTracker) scores(auths []*Auth) []float64 {
 	scores := make([]float64, len(auths))
+	t.fillScores(auths, scores)
+	return scores
+}
+
+// fillScores captures one coherent snapshot under the tracker lock. Callers may
+// provide stack storage without sharing mutable scratch space across requests.
+func (t *credentialLoadTracker) fillScores(auths []*Auth, scores []float64) {
 	if t == nil {
-		return scores
+		return
 	}
 	now := t.now()
 	t.mu.Lock()
@@ -100,7 +107,6 @@ func (t *credentialLoadTracker) scores(auths []*Auth) []float64 {
 		}
 		scores[i] = score
 	}
-	return scores
 }
 
 // leastLoaded keeps the auths whose load is within tolerance of the least
@@ -110,7 +116,14 @@ func (t *credentialLoadTracker) leastLoaded(auths []*Auth, tolerance float64) []
 	if t == nil || len(auths) <= 1 {
 		return auths
 	}
-	scores := t.scores(auths)
+	var localScores [128]float64
+	scores := localScores[:]
+	if len(auths) > len(localScores) {
+		scores = make([]float64, len(auths))
+	} else {
+		scores = scores[:len(auths)]
+	}
+	t.fillScores(auths, scores)
 	minScore := math.Inf(1)
 	for _, score := range scores {
 		minScore = math.Min(minScore, score)
