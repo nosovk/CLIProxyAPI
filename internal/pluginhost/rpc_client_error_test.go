@@ -91,16 +91,18 @@ func TestPluginErrorCarriesRetryAfterIntoCooldownAndHTTPHeader(t *testing.T) {
 	if errExec == nil {
 		t.Fatal("authMgr.Execute returned nil error")
 	}
-	if got := coreauth.SafeResponseHeaders(errExec).Get("Retry-After"); got != "7" {
-		t.Fatalf("SafeResponseHeaders(errExec) Retry-After = %q, want 7", got)
+	// The decoded plugin error retains its 7s hint, but the terminal error must
+	// advertise the pool's actual recovery after the 10s cooldown floor is applied.
+	if got := coreauth.SafeResponseHeaders(errExec).Get("Retry-After"); got != "10" {
+		t.Fatalf("SafeResponseHeaders(errExec) Retry-After = %q, want 10 (pool cooldown floor)", got)
 	}
 	updated, okAuth := authMgr.GetByID(authID)
 	if !okAuth || updated == nil {
 		t.Fatalf("GetByID(%q) missing", authID)
 	}
 	state := updated.ModelStates[model]
-	if state == nil || !state.NextRetryAfter.After(before.Add(5*time.Second)) {
-		t.Fatalf("model NextRetryAfter = %v, want at least %v (7s cooldown)", state, before.Add(7*time.Second))
+	if state == nil || state.NextRetryAfter.Before(before.Add(10*time.Second)) {
+		t.Fatalf("model NextRetryAfter = %v, want at least %v (10s cooldown floor)", state, before.Add(10*time.Second))
 	}
 }
 
