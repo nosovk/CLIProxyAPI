@@ -34,6 +34,7 @@ type RequestInfo struct {
 	RequestID           string                      // RequestID is the unique identifier for the request.
 	Timestamp           time.Time                   // Timestamp is when the request was received.
 	deferredBodyCapture *deferredRequestBodyCapture // deferredBodyCapture spools large error-only request bodies.
+	LogFormat           string
 }
 
 // ResponseWriterWrapper wraps the standard gin.ResponseWriter to intercept and log response data.
@@ -117,6 +118,7 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 		select {
 		case w.chunkChannel <- append([]byte(nil), data...): // Non-blocking send with copy
 		default: // Channel full, skip logging to avoid blocking
+			w.markStreamingLogTruncated()
 		}
 		return n, err
 	}
@@ -204,6 +206,7 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 		select {
 		case w.chunkChannel <- []byte(data):
 		default:
+			w.markStreamingLogTruncated()
 		}
 		return n, err
 	}
@@ -212,6 +215,12 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 		w.body.WriteString(data)
 	}
 	return n, err
+}
+
+func (w *ResponseWriterWrapper) markStreamingLogTruncated() {
+	if marker, ok := w.streamWriter.(interface{ MarkResponseBodyTruncated() }); ok {
+		marker.MarkResponseBodyTruncated()
+	}
 }
 
 // WriteHeader wraps the underlying ResponseWriter's WriteHeader method.
@@ -240,13 +249,15 @@ func (w *ResponseWriterWrapper) WriteHeader(statusCode int) {
 			if !w.panicked && isUnroutedNotFound(w.ginContext, statusCode, extractAPIResponseErrors(w.ginContext)) {
 				w.isStreaming = false
 			} else {
-				streamWriter, err := w.logger.LogStreamingRequest(
-					w.requestInfo.URL,
-					w.requestInfo.Method,
-					w.requestInfo.Headers,
-					w.currentCapturedRequestBody(),
-					w.requestInfo.RequestID,
-				)
+				var streamWriter logging.StreamingLogWriter
+				var err error
+				if loggerWithFormat, ok := w.logger.(interface {
+					LogStreamingRequestWithFormat(string, string, map[string][]string, []byte, string, string) (logging.StreamingLogWriter, error)
+				}); ok {
+					streamWriter, err = loggerWithFormat.LogStreamingRequestWithFormat(w.requestInfo.URL, w.requestInfo.Method, w.requestInfo.Headers, w.currentCapturedRequestBody(), w.requestInfo.RequestID, w.requestInfo.LogFormat)
+				} else {
+					streamWriter, err = w.logger.LogStreamingRequest(w.requestInfo.URL, w.requestInfo.Method, w.requestInfo.Headers, w.currentCapturedRequestBody(), w.requestInfo.RequestID)
+				}
 				if err == nil {
 					chunkChan := make(chan []byte, 100) // Buffered channel for async writes
 					doneChan := make(chan struct{})
@@ -412,6 +423,9 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		cleanupFileBodySources(websocketTimelineSource, apiRequestSource, apiResponseSource, apiWebsocketTimelineSource)
 		return errDiscard
 	}
+	if forceLog && apiRequestSource == nil && apiResponseSource == nil && websocketTimelineSource == nil && apiWebsocketTimelineSource == nil {
+		apiRequestSource = w.newRequestLogFormatSource()
+	}
 
 	if w.isStreaming && w.streamWriter != nil {
 		if w.chunkChannel != nil {
@@ -465,12 +479,6 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 			}
 		}
 		apiWebsocketTimeline := w.extractAPIWebsocketTimeline(c)
-		var errMerge error
-		apiWebsocketTimeline, errMerge = mergeFileBodySource(apiWebsocketTimeline, apiWebsocketTimelineSource)
-		if errMerge != nil {
-			cleanupFileBodySources(websocketTimelineSource, apiRequestSource, apiResponseSource)
-			return errMerge
-		}
 		if len(apiWebsocketTimeline) > 0 {
 			_ = w.streamWriter.WriteAPIWebsocketTimeline(apiWebsocketTimeline)
 		}
@@ -479,6 +487,21 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		}
 		if len(slicesAPIResponseError) > 0 {
 			_ = w.streamWriter.WriteAPIResponseErrors(slicesAPIResponseError)
+		}
+		if sourceWriter, ok := w.streamWriter.(interface {
+			WriteAPIWebsocketTimelineSource(*logging.FileBodySource) error
+		}); ok && apiWebsocketTimelineSource != nil && apiWebsocketTimelineSource.HasPayload() {
+			_ = sourceWriter.WriteAPIWebsocketTimelineSource(apiWebsocketTimelineSource)
+		} else {
+			var errMerge error
+			apiWebsocketTimeline, errMerge = mergeFileBodySource(nil, apiWebsocketTimelineSource)
+			if errMerge != nil {
+				cleanupFileBodySources(websocketTimelineSource, apiRequestSource, apiResponseSource)
+				return errMerge
+			}
+			if len(apiWebsocketTimeline) > 0 {
+				_ = w.streamWriter.WriteAPIWebsocketTimeline(apiWebsocketTimeline)
+			}
 		}
 		if err := w.streamWriter.Close(); err != nil {
 			w.streamWriter = nil
@@ -501,6 +524,21 @@ func (w *ResponseWriterWrapper) Finalize(c *gin.Context) error {
 		}
 	}
 	return w.logRequest(w.extractRequestBody(c), finalStatusCode, w.cloneHeaders(), w.extractResponseBody(c), w.extractWebsocketTimeline(c), websocketTimelineSource, apiRequest, apiRequestSource, apiResponse, apiResponseSource, w.extractAPIWebsocketTimeline(c), apiWebsocketTimelineSource, w.extractAPIResponseTimestamp(c), slicesAPIResponseError, forceLog)
+}
+
+func (w *ResponseWriterWrapper) newRequestLogFormatSource() *logging.FileBodySource {
+	if w == nil || w.requestInfo == nil || w.requestInfo.LogFormat == "" {
+		return nil
+	}
+	factory, ok := w.logger.(formattedFileBodySourceFactory)
+	if !ok || factory == nil {
+		return nil
+	}
+	source, errSource := factory.NewFileBodySourceWithFormat("request-format", w.requestInfo.LogFormat)
+	if errSource != nil {
+		return nil
+	}
+	return source
 }
 
 func (w *ResponseWriterWrapper) cloneHeaders() map[string][]string {

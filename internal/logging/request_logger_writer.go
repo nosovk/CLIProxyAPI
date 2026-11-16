@@ -72,8 +72,19 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		return nil
 	}
 
+	format := requestLogFormatFromSources(apiRequestSource, apiResponseSource, websocketTimelineSource, apiWebsocketTimelineSource)
+	if format == "" {
+		format = l.currentFormat()
+	}
+
 	if l.homeEnabled && l.enabled {
-		responseToWrite, decompressErr := l.decompressResponse(responseHeaders, response)
+		var responseToWrite []byte
+		var decompressErr error
+		if format == "json" {
+			responseToWrite, decompressErr = l.decompressResponseWithLimit(responseHeaders, response, maxJSONFileBackedSectionBytes)
+		} else {
+			responseToWrite, decompressErr = l.decompressResponse(responseHeaders, response)
+		}
 		if decompressErr != nil {
 			responseToWrite = response
 		}
@@ -86,6 +97,7 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 			requestHeaders,
 			body,
 			"",
+			false,
 			websocketTimeline,
 			websocketTimelineSource,
 			apiRequest,
@@ -119,7 +131,7 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		filename = l.generateErrorFilename(url, requestID)
 	}
 
-	requestBodyPath, errTemp := l.writeRequestBodyTempFile(body)
+	requestBodyPath, requestBodyTruncated, errTemp := l.writeRequestBodyTempFile(body, format)
 	if errTemp != nil {
 		log.WithError(errTemp).Warn("failed to create request body temp file, falling back to direct write")
 	}
@@ -131,7 +143,13 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		}()
 	}
 
-	responseToWrite, decompressErr := l.decompressResponse(responseHeaders, response)
+	var responseToWrite []byte
+	var decompressErr error
+	if format == "json" {
+		responseToWrite, decompressErr = l.decompressResponseWithLimit(responseHeaders, response, maxJSONFileBackedSectionBytes)
+	} else {
+		responseToWrite, decompressErr = l.decompressResponse(responseHeaders, response)
+	}
 	if decompressErr != nil {
 		// If decompression fails, continue with original response and annotate the log output.
 		responseToWrite = response
@@ -149,6 +167,7 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 		requestHeaders,
 		body,
 		requestBodyPath,
+		requestBodyTruncated,
 		websocketTimeline,
 		websocketTimelineSource,
 		apiRequest,
@@ -197,6 +216,12 @@ func (l *FileRequestLogger) logRequestWithSources(url, method string, requestHea
 //   - StreamingLogWriter: A writer for streaming response chunks
 //   - error: An error if logging initialization fails, nil otherwise
 func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[string][]string, body []byte, requestID string) (StreamingLogWriter, error) {
+	return l.LogStreamingRequestWithFormat(url, method, headers, body, requestID, l.currentFormat())
+}
+
+// LogStreamingRequestWithFormat starts streaming logging with a per-request format snapshot.
+func (l *FileRequestLogger) LogStreamingRequestWithFormat(url, method string, headers map[string][]string, body []byte, requestID, format string) (StreamingLogWriter, error) {
+	format = normalizeRequestLogFormat(format)
 	if !l.enabled {
 		return &NoOpStreamingLogWriter{}, nil
 	}
@@ -206,7 +231,7 @@ func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[
 		if client == nil || !client.HeartbeatOK() {
 			return &NoOpStreamingLogWriter{}, nil
 		}
-		return newHomeStreamingLogWriter(url, method, headers, body, requestID), nil
+		return newHomeStreamingLogWriter(url, method, headers, body, requestID, format), nil
 	}
 
 	// Ensure logs directory exists
@@ -224,7 +249,7 @@ func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[
 		requestHeaders[key] = headerValues
 	}
 
-	requestBodyPath, errTemp := l.writeRequestBodyTempFile(body)
+	requestBodyPath, requestBodyTruncated, errTemp := l.writeRequestBodyTempFile(body, format)
 	if errTemp != nil {
 		return nil, fmt.Errorf("failed to create request body temp file: %w", errTemp)
 	}
@@ -238,18 +263,20 @@ func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[
 
 	// Create streaming writer
 	writer := &FileStreamingLogWriter{
-		logsDir:          l.logsDir,
-		logFilename:      filename,
-		url:              url,
-		method:           method,
-		timestamp:        time.Now(),
-		requestHeaders:   requestHeaders,
-		requestBodyPath:  requestBodyPath,
-		responseBodyPath: responseBodyPath,
-		responseBodyFile: responseBodyFile,
-		chunkChan:        make(chan []byte, 100), // Buffered channel for async writes
-		closeChan:        make(chan struct{}),
-		errorChan:        make(chan error, 1),
+		logsDir:              l.logsDir,
+		logFilename:          filename,
+		url:                  url,
+		method:               method,
+		timestamp:            time.Now(),
+		requestHeaders:       requestHeaders,
+		requestBodyPath:      requestBodyPath,
+		requestBodyTruncated: requestBodyTruncated,
+		responseBodyPath:     responseBodyPath,
+		responseBodyFile:     responseBodyFile,
+		chunkChan:            make(chan []byte, 100), // Buffered channel for async writes
+		closeChan:            make(chan struct{}),
+		errorChan:            make(chan error, 1),
+		format:               format,
 	}
 
 	// Start async writer goroutine
@@ -444,21 +471,25 @@ func (l *FileRequestLogger) cleanupOldErrorLogs() error {
 	return nil
 }
 
-func (l *FileRequestLogger) writeRequestBodyTempFile(body []byte) (string, error) {
+func (l *FileRequestLogger) writeRequestBodyTempFile(body []byte, format string) (string, bool, error) {
 	tmpFile, errCreate := os.CreateTemp(l.logsDir, "request-body-*.tmp")
 	if errCreate != nil {
-		return "", errCreate
+		return "", false, errCreate
 	}
 	tmpPath := tmpFile.Name()
+	truncated := normalizeRequestLogFormat(format) == "json" && len(body) > maxJSONFileBackedSectionBytes
+	if truncated {
+		body = body[:maxJSONFileBackedSectionBytes]
+	}
 
 	if _, errCopy := io.Copy(tmpFile, bytes.NewReader(body)); errCopy != nil {
 		_ = tmpFile.Close()
 		_ = os.Remove(tmpPath)
-		return "", errCopy
+		return "", false, errCopy
 	}
 	if errClose := tmpFile.Close(); errClose != nil {
 		_ = os.Remove(tmpPath)
-		return "", errClose
+		return "", false, errClose
 	}
-	return tmpPath, nil
+	return tmpPath, truncated, nil
 }
