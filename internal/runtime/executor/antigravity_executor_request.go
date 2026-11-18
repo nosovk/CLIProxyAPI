@@ -33,6 +33,10 @@ type antigravityPreparedRequest struct {
 	originalTranslated []byte
 	translated         []byte
 	cooldownRejected   bool
+	tieredBaseModel    string
+	tieredModel        string
+	tieredCooldownTTL  time.Duration
+	hasTieredFallback  bool
 }
 
 func (e *AntigravityExecutor) prepareAntigravityRequest(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, baseModel string, stream, countTokens bool) (antigravityPreparedRequest, error) {
@@ -53,6 +57,17 @@ func (e *AntigravityExecutor) prepareAntigravityRequest(ctx context.Context, aut
 	translate := func(credential *cliproxyauth.Auth) error {
 		translateCtx := cache.WithSignatureCacheScope(ctx, antigravitySignatureCacheScope(credential))
 		model := helps.SelectAntigravityRequestModel(translateCtx, e.cfg, credential, req.Model, baseModel, from.String(), source, countTokens)
+		if !countTokens {
+			prepared.tieredBaseModel = model.ID
+			upstreamModel, tieredModel, ttl, enabled, errTiered := e.selectAntigravityUpstreamModel(ctx, credential, model.ID, opts.Headers)
+			if errTiered != nil {
+				return rejectCooldown(model.ID, errTiered)
+			}
+			prepared.tieredModel, prepared.tieredCooldownTTL, prepared.hasTieredFallback = tieredModel, ttl, enabled
+			if upstreamModel != model.ID {
+				model.AntigravityModelSelection = cliproxyauth.SelectAntigravityModel(ctx, credential, upstreamModel, "", e.cfg)
+			}
+		}
 		if model.ID != baseModel {
 			if errCooldown := cliproxyauth.CheckAntigravityTargetModel(ctx, credential, model.ID, time.Now(), useCredits); errCooldown != nil {
 				return rejectCooldown(model.ID, errCooldown)

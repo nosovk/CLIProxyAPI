@@ -113,23 +113,14 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	if replayScope.valid() {
 		replayRequestPayload, _ = antigravityReplayRequestEnvelopeFromDoc(doc)
 	}
-	httpReq, requestPayload, errReq := e.buildRequestForModelDoc(ctx, auth, prepared.token, selection.AntigravityModelSelection, doc, true, opts.Alt, baseURL, helps.AntigravitySessionIDForAuth(antigravityAuthID(auth), opts.Metadata, req.Metadata))
-	if errReq != nil {
-		err = errReq
-		return nil, err
+	httpResp, upstreamModel, requestPayload, errDo := e.doWithTieredFallback(ctx, auth, prepared, baseURL, "generate_stream", true, req, opts, doc, httpClient, reporter, to)
+	if len(requestPayload) > 0 {
+		translated = requestPayload
 	}
-	translated = requestPayload
-	reporter.SetTranslatedRequestMetadata(requestPayload, to.String())
-	httpResp, errDo := helps.WithAntigravityHTTPClientTrace(httpClient, auth, "generate_stream").Do(httpReq)
 	if errDo != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
-			return nil, errDo
-		}
 		err = errDo
 		return nil, err
 	}
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
 		bodyBytes, errRead := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -149,7 +140,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 			err = errRead
 			return nil, err
 		}
-		err = e.applyAntigravityUpstreamError(ctx, auth, selection.ID, useCredits, replayScope, httpResp.StatusCode, httpResp.Header, bodyBytes)
+		err = e.applyAntigravityUpstreamError(ctx, auth, upstreamModel, useCredits, replayScope, httpResp.StatusCode, httpResp.Header, bodyBytes)
 		return nil, err
 	}
 	if len(replayRequestPayload) == 0 {
@@ -258,7 +249,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 
 			if errorResult := ojson.GetBytesNoCopy(payload, "error"); errorResult.Exists() && errorResult.Type != ojson.Null {
 				statusCode := antigravityInBandErrorStatusCode(errorResult)
-				streamErr = e.applyAntigravityUpstreamError(ctx, auth, selection.ID, useCredits, replayScope, statusCode, nil, payload)
+				streamErr = e.applyAntigravityUpstreamError(ctx, auth, upstreamModel, useCredits, replayScope, statusCode, nil, payload)
 				stopDeliverySupport()
 				helps.RecordAPIResponseError(ctx, e.cfg, streamErr)
 				select {
@@ -277,6 +268,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 				if len(p) == 0 {
 					return true
 				}
+				p = antigravityNormalizeResponseModelVersion(p, baseModel, upstreamModel)
 				reporter.ObserveResponseModel(p)
 
 				p = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalPayload, translated, p)
@@ -467,6 +459,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 					if len(shellFiltered) == 0 {
 						continue
 					}
+					shellFiltered = antigravityNormalizeResponseModelVersion(shellFiltered, baseModel, upstreamModel)
 					reporter.ObserveResponseModel(shellFiltered)
 					shellFiltered = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalPayload, translated, shellFiltered)
 					shellChunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, bytes.Clone(shellFiltered), &param, claudeInputTokens)

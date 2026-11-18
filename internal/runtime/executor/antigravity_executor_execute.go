@@ -114,25 +114,14 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 		replayRequestPayload, _ = antigravityReplayRequestEnvelopeFromDoc(doc)
 	}
 
-	httpReq, requestPayload, errReq := e.buildRequestForModelDoc(ctx, auth, prepared.token, selection.AntigravityModelSelection, doc, false, opts.Alt, baseURL, helps.AntigravitySessionIDForAuth(antigravityAuthID(auth), opts.Metadata, req.Metadata))
-	if errReq != nil {
-		err = errReq
-		return resp, err
+	httpResp, upstreamModel, requestPayload, errDo := e.doWithTieredFallback(ctx, auth, prepared, baseURL, "generate", false, req, opts, doc, httpClient, reporter, to)
+	if len(requestPayload) > 0 {
+		translated = requestPayload
 	}
-	translated = requestPayload
-	reporter.SetTranslatedRequestMetadata(requestPayload, to.String())
-
-	httpResp, errDo := helps.WithAntigravityHTTPClientTrace(httpClient, auth, "generate").Do(httpReq)
 	if errDo != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
-			return resp, errDo
-		}
 		err = errDo
 		return resp, err
 	}
-
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	bodyBytes, errRead := io.ReadAll(httpResp.Body)
 	if errClose := httpResp.Body.Close(); errClose != nil {
 		log.Errorf("antigravity executor: close response body error: %v", errClose)
@@ -146,7 +135,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 
 	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
 		log.Debugf("antigravity executor: upstream error status: %d, body: %s", httpResp.StatusCode, helps.SummarizeErrorBody(httpResp.Header.Get("Content-Type"), bodyBytes))
-		err = e.applyAntigravityUpstreamError(ctx, auth, selection.ID, useCredits, replayScope, httpResp.StatusCode, httpResp.Header, bodyBytes)
+		err = e.applyAntigravityUpstreamError(ctx, auth, upstreamModel, useCredits, replayScope, httpResp.StatusCode, httpResp.Header, bodyBytes)
 		return resp, err
 	}
 
@@ -156,12 +145,13 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if errorResult := ojson.GetBytesNoCopy(bodyBytes, "error"); errorResult.Exists() && errorResult.Type != ojson.Null {
 		statusCode := antigravityInBandErrorStatusCode(errorResult)
 		log.Debugf("antigravity executor: upstream in-band error status: %d", statusCode)
-		err = e.applyAntigravityUpstreamError(ctx, auth, selection.ID, useCredits, replayScope, statusCode, httpResp.Header, bodyBytes)
+		err = e.applyAntigravityUpstreamError(ctx, auth, upstreamModel, useCredits, replayScope, statusCode, httpResp.Header, bodyBytes)
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
 
 	// Success
+	bodyBytes = antigravityNormalizeResponseModelVersion(bodyBytes, baseModel, upstreamModel)
 	reporter.ObserveResponseModel(bodyBytes)
 	if _, zeroErrMsg, zeroOutput := helps.CheckGeminiZeroOutputNonStream(responseFormat, bodyBytes, true); zeroOutput {
 		antiDetail := helps.ParseAntigravityUsage(bodyBytes)
@@ -306,24 +296,14 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	if replayScope.valid() {
 		replayRequestPayload, _ = antigravityReplayRequestEnvelopeFromDoc(doc)
 	}
-	httpReq, requestPayload, errReq := e.buildRequestForModelDoc(ctx, auth, prepared.token, selection.AntigravityModelSelection, doc, true, opts.Alt, baseURL, helps.AntigravitySessionIDForAuth(antigravityAuthID(auth), opts.Metadata, req.Metadata))
-	if errReq != nil {
-		err = errReq
-		return resp, err
+	httpResp, upstreamModel, requestPayload, errDo := e.doWithTieredFallback(ctx, auth, prepared, baseURL, "generate", true, req, opts, doc, httpClient, reporter, to)
+	if len(requestPayload) > 0 {
+		translated = requestPayload
 	}
-	translated = requestPayload
-	reporter.SetTranslatedRequestMetadata(requestPayload, to.String())
-
-	httpResp, errDo := helps.WithAntigravityHTTPClientTrace(httpClient, auth, "generate").Do(httpReq)
 	if errDo != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
-			return resp, errDo
-		}
 		err = errDo
 		return resp, err
 	}
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
 		bodyBytes, errRead := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -343,7 +323,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 			err = errRead
 			return resp, err
 		}
-		err = e.applyAntigravityUpstreamError(ctx, auth, selection.ID, useCredits, replayScope, httpResp.StatusCode, httpResp.Header, bodyBytes)
+		err = e.applyAntigravityUpstreamError(ctx, auth, upstreamModel, useCredits, replayScope, httpResp.StatusCode, httpResp.Header, bodyBytes)
 		return resp, err
 	}
 
@@ -372,7 +352,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 			if errClose := httpResp.Body.Close(); errClose != nil {
 				log.Errorf("antigravity executor: close response body error: %v", errClose)
 			}
-			err = e.applyAntigravityUpstreamError(ctx, auth, selection.ID, useCredits, replayScope, statusCode, nil, payload)
+			err = e.applyAntigravityUpstreamError(ctx, auth, upstreamModel, useCredits, replayScope, statusCode, nil, payload)
 			helps.RecordAPIResponseError(ctx, e.cfg, err)
 			reporter.PublishFailure(ctx, err)
 			return resp, err
@@ -381,6 +361,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 			replayAccumulator.ObserveSSELine(payload)
 		}
 		if len(pendingFilterPayload) > 0 && geminiPayloadHasContentParts(payload) {
+			pendingFilterPayload = antigravityNormalizeResponseModelVersion(pendingFilterPayload, baseModel, upstreamModel)
 			reporter.ObserveResponseModel(pendingFilterPayload)
 			rawPayloads = append(rawPayloads, pendingFilterPayload)
 			pendingFilterPayload = nil
@@ -391,6 +372,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 			pendingFilterMsg = filterMsg
 			continue
 		}
+		payload = antigravityNormalizeResponseModelVersion(payload, baseModel, upstreamModel)
 		reporter.ObserveResponseModel(payload)
 		rawPayloads = append(rawPayloads, bytes.Clone(payload))
 	}
@@ -421,7 +403,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 		reporter.PublishFailure(ctx, err)
 		return cliproxyexecutor.Response{}, err
 	}
-	aggregatedPayload := e.convertStreamChunksToNonStream(rawPayloads)
+	aggregatedPayload := antigravityNormalizeResponseModelVersion(e.convertStreamChunksToNonStream(rawPayloads), baseModel, upstreamModel)
 	reporter.ObserveResponseModel(aggregatedPayload)
 	if _, zeroErrMsg, zeroOutput := helps.CheckGeminiZeroOutputNonStream(responseFormat, aggregatedPayload, true); zeroOutput {
 		antiDetail := helps.ParseAntigravityUsage(aggregatedPayload)
