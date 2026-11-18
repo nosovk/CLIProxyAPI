@@ -2,8 +2,6 @@ package logging
 
 import (
 	"bytes"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +9,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/MoeForge/moego/base64"
+	"github.com/MoeForge/moego/json"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
@@ -62,6 +62,7 @@ type jsonLogError struct {
 
 type jsonLogResponse struct {
 	Status             int                 `json:"status"`
+	Errors             []string            `json:"errors,omitempty"`
 	Headers            map[string][]string `json:"headers,omitempty"`
 	Body               json.RawMessage     `json:"body,omitempty"`
 	BodyRaw            string              `json:"body_raw,omitempty"`
@@ -112,6 +113,7 @@ func writeJSONLog(
 	downstreamTransport string,
 	upstreamTransport string,
 ) error {
+	apiResponseErrors, diagnostics := splitResponseDiagnostics(apiResponseErrors)
 	if requestTimestamp.IsZero() {
 		requestTimestamp = time.Now()
 	}
@@ -187,7 +189,7 @@ func writeJSONLog(
 	setJSONRawPayload(downstreamTimeline, &entry.WebsocketTimelineRaw, &entry.WebsocketTimelineEncoding)
 	entry.WebsocketTimelineTruncated = truncated
 
-	responseEntry := &jsonLogResponse{Status: statusCode, Headers: maskHeaders(responseHeaders)}
+	responseEntry := &jsonLogResponse{Status: statusCode, Errors: diagnostics, Headers: maskHeaders(responseHeaders)}
 	if decompressErr != nil {
 		responseEntry.DecompressionError = decompressErr.Error()
 	}

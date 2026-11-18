@@ -65,6 +65,7 @@ verify_invariant ./internal/logging \
   TestJSONRequestLogging \
   TestJSONStreamingRequestLogging \
   TestJSONRequestLoggingSerializesErrorsAndMasksAddonHeaders \
+  TestResponseDiagnosticsInFileAndHomeLogs \
   TestFileRequestLogger_HomeEnabled_BoundsNonStreamingJSONBodies \
   TestFileRequestLogger_HomeEnabled_BoundsStreamingJSONBodies \
   TestFileRequestLogger_HomeEnabled_BoundsStreamingJSONUpstreamSources \

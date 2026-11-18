@@ -343,7 +343,7 @@ func (w *FileStreamingLogWriter) writeFinalLog(logFile *os.File) error {
 	apiErrors, diagnostics := splitResponseDiagnostics(w.apiResponseErrors)
 	upstreamTransport := inferUpstreamTransport(w.apiRequest, w.apiRequestSource, w.apiResponse, w.apiResponseSource, w.apiWebsocketTimeline, w.apiWebsocketTimelineSource)
 	if w.format == "json" {
-		return writeJSONLog(logFile, w.url, w.method, w.requestHeaders, nil, w.requestBodyPath, w.requestBodyTruncated, w.responseStatus, w.responseHeaders, nil, w.responseBodyPath, w.responseBodyTruncated.Load(), nil, w.apiRequest, w.apiRequestSource, w.apiResponse, w.apiResponseSource, nil, nil, nil, w.apiWebsocketTimeline, w.apiWebsocketTimelineSource, w.timestamp, w.apiResponseTimestamp, "http", upstreamTransport)
+		return writeJSONLog(logFile, w.url, w.method, w.requestHeaders, nil, w.requestBodyPath, w.requestBodyTruncated, w.responseStatus, w.responseHeaders, nil, w.responseBodyPath, w.responseBodyTruncated.Load(), nil, w.apiRequest, w.apiRequestSource, w.apiResponse, w.apiResponseSource, w.apiResponseErrors, nil, nil, w.apiWebsocketTimeline, w.apiWebsocketTimelineSource, w.timestamp, w.apiResponseTimestamp, "http", upstreamTransport)
 	}
 
 	if errWrite := writeRequestInfoWithBody(logFile, w.url, w.method, w.requestHeaders, nil, w.requestBodyPath, w.timestamp, "http", upstreamTransport, true); errWrite != nil {
