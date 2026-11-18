@@ -47,14 +47,9 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if antigravityInTOSPause(e.cfg, auth) {
 		return resp, statusErr{code: http.StatusServiceUnavailable, msg: "antigravity pool paused after TOS_VIOLATION"}
 	}
-	if !antigravityCoolingDisabled(auth, e.cfg) {
-		if inCooldown, remaining, errCooldown := antigravityIsInShortCooldownRequired(ctx, auth, baseModel, time.Now()); errCooldown != nil {
-			return resp, homeKVUnavailableStatusErr(errCooldown)
-		} else if inCooldown && !antigravityShouldBypassShortCooldown(ctx, e.cfg) {
-			log.Debugf("antigravity executor: auth %s in short cooldown for model %s (%s remaining), returning 429 to switch auth", auth.ID, baseModel, remaining)
-			d := remaining
-			return resp, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("auth in short cooldown, %s remaining", remaining), retryAfter: &d}
-		}
+	upstreamModel, tieredModel, tieredCooldownTTL, hasTieredFallback, errCooldown := e.selectAntigravityUpstreamModel(ctx, auth, baseModel, opts.Headers)
+	if errCooldown != nil {
+		return resp, errCooldown
 	}
 
 	isClaude := strings.Contains(strings.ToLower(baseModel), "claude")
@@ -132,25 +127,17 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 		replayRequestPayload, _ = antigravityReplayRequestEnvelopeFromDoc(doc)
 	}
 
-	httpReq, requestPayload, errReq := e.buildRequestDoc(ctx, auth, token, baseModel, doc, false, opts.Alt, baseURL, helps.DerivedAntigravitySessionID(opts.Metadata, req.Metadata))
-	if errReq != nil {
-		err = errReq
-		return resp, err
+	var httpResp *http.Response
+	var requestPayload []byte
+	var errDo error
+	httpResp, upstreamModel, requestPayload, errDo = e.doWithTieredFallback(ctx, auth, token, baseURL, "generate", false, req, opts, doc, baseModel, upstreamModel, tieredModel, tieredCooldownTTL, hasTieredFallback, httpClient, reporter, to)
+	if len(requestPayload) > 0 {
+		translated = requestPayload
 	}
-	translated = requestPayload
-	reporter.SetTranslatedRequestMetadata(requestPayload, to.String())
-
-	httpResp, errDo := helps.WithAntigravityHTTPClientTrace(httpClient, auth, "generate").Do(httpReq)
 	if errDo != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
-			return resp, errDo
-		}
 		err = errDo
 		return resp, err
 	}
-
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	bodyBytes, errRead := io.ReadAll(httpResp.Body)
 	if errClose := httpResp.Body.Close(); errClose != nil {
 		log.Errorf("antigravity executor: close response body error: %v", errClose)
@@ -168,7 +155,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 		case antigravity429DecisionShortCooldownSwitchAuth:
 			closeAntigravityAuthIdleTransports(auth)
 			if decision.retryAfter != nil && *decision.retryAfter > 0 && !antigravityCoolingDisabled(auth, e.cfg) {
-				if errMarkCooldown := markAntigravityShortCooldownRequired(ctx, auth, baseModel, time.Now(), *decision.retryAfter); errMarkCooldown != nil {
+				if errMarkCooldown := markAntigravityModelsShortCooldown(ctx, auth, baseModel, upstreamModel, time.Now(), *decision.retryAfter); errMarkCooldown != nil {
 					err = homeKVUnavailableStatusErr(errMarkCooldown)
 					return resp, err
 				}
@@ -200,6 +187,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if useCredits {
 		clearAntigravityCreditsFailureState(auth)
 	}
+	bodyBytes = antigravityNormalizeResponseModelVersion(bodyBytes, baseModel, upstreamModel)
 	reporter.ObserveResponseModel(bodyBytes)
 	if _, zeroErrMsg, zeroOutput := helps.CheckGeminiZeroOutputNonStream(responseFormat, bodyBytes, true); zeroOutput {
 		antiDetail := helps.ParseAntigravityUsage(bodyBytes)
@@ -294,14 +282,9 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	if antigravityInTOSPause(e.cfg, auth) {
 		return resp, statusErr{code: http.StatusServiceUnavailable, msg: "antigravity pool paused after TOS_VIOLATION"}
 	}
-	if !antigravityCoolingDisabled(auth, e.cfg) {
-		if inCooldown, remaining, errCooldown := antigravityIsInShortCooldownRequired(ctx, auth, baseModel, time.Now()); errCooldown != nil {
-			return resp, homeKVUnavailableStatusErr(errCooldown)
-		} else if inCooldown && !antigravityShouldBypassShortCooldown(ctx, e.cfg) {
-			log.Debugf("antigravity executor: auth %s in short cooldown for model %s (%s remaining), returning 429 to switch auth", auth.ID, baseModel, remaining)
-			d := remaining
-			return resp, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("auth in short cooldown, %s remaining", remaining), retryAfter: &d}
-		}
+	upstreamModel, tieredModel, tieredCooldownTTL, hasTieredFallback, errCooldown := e.selectAntigravityUpstreamModel(ctx, auth, baseModel, opts.Headers)
+	if errCooldown != nil {
+		return resp, errCooldown
 	}
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
@@ -374,24 +357,17 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	if replayScope.valid() {
 		replayRequestPayload, _ = antigravityReplayRequestEnvelopeFromDoc(doc)
 	}
-	httpReq, requestPayload, errReq := e.buildRequestDoc(ctx, auth, token, baseModel, doc, true, opts.Alt, baseURL, helps.DerivedAntigravitySessionID(opts.Metadata, req.Metadata))
-	if errReq != nil {
-		err = errReq
-		return resp, err
+	var httpResp *http.Response
+	var requestPayload []byte
+	var errDo error
+	httpResp, upstreamModel, requestPayload, errDo = e.doWithTieredFallback(ctx, auth, token, baseURL, "generate", true, req, opts, doc, baseModel, upstreamModel, tieredModel, tieredCooldownTTL, hasTieredFallback, httpClient, reporter, to)
+	if len(requestPayload) > 0 {
+		translated = requestPayload
 	}
-	translated = requestPayload
-	reporter.SetTranslatedRequestMetadata(requestPayload, to.String())
-
-	httpResp, errDo := helps.WithAntigravityHTTPClientTrace(httpClient, auth, "generate").Do(httpReq)
 	if errDo != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
-			return resp, errDo
-		}
 		err = errDo
 		return resp, err
 	}
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
 		bodyBytes, errRead := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -418,7 +394,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 			case antigravity429DecisionShortCooldownSwitchAuth:
 				closeAntigravityAuthIdleTransports(auth)
 				if decision.retryAfter != nil && *decision.retryAfter > 0 && !antigravityCoolingDisabled(auth, e.cfg) {
-					if errMarkCooldown := markAntigravityShortCooldownRequired(ctx, auth, baseModel, time.Now(), *decision.retryAfter); errMarkCooldown != nil {
+					if errMarkCooldown := markAntigravityModelsShortCooldown(ctx, auth, baseModel, upstreamModel, time.Now(), *decision.retryAfter); errMarkCooldown != nil {
 						err = homeKVUnavailableStatusErr(errMarkCooldown)
 						return resp, err
 					}
@@ -507,6 +483,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 			}
 		}
 		if len(pendingFilterPayload) > 0 {
+			pendingFilterPayload = antigravityNormalizeResponseModelVersion(pendingFilterPayload, baseModel, upstreamModel)
 			reporter.ObserveResponseModel(pendingFilterPayload)
 			rawPayloads = append(rawPayloads, pendingFilterPayload)
 			pendingFilterPayload = nil
@@ -517,6 +494,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 			pendingFilterMsg = filterMsg
 			continue
 		}
+		payload = antigravityNormalizeResponseModelVersion(payload, baseModel, upstreamModel)
 		reporter.ObserveResponseModel(payload)
 		rawPayloads = append(rawPayloads, bytes.Clone(payload))
 	}
@@ -535,7 +513,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 		reporter.PublishFailure(ctx, filterErr)
 		return resp, filterErr
 	}
-	aggregatedPayload := e.convertStreamChunksToNonStream(rawPayloads)
+	aggregatedPayload := antigravityNormalizeResponseModelVersion(e.convertStreamChunksToNonStream(rawPayloads), baseModel, upstreamModel)
 	reporter.ObserveResponseModel(aggregatedPayload)
 	if _, zeroErrMsg, zeroOutput := helps.CheckGeminiZeroOutputNonStream(responseFormat, aggregatedPayload, true); zeroOutput {
 		antiDetail := helps.ParseAntigravityUsage(aggregatedPayload)

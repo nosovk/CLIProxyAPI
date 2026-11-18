@@ -51,14 +51,9 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 		return nil, statusErr{code: http.StatusServiceUnavailable, msg: "antigravity pool paused after TOS_VIOLATION"}
 	}
 	ctx = context.WithValue(ctx, "alt", "")
-	if !antigravityCoolingDisabled(auth, e.cfg) {
-		if inCooldown, remaining, errCooldown := antigravityIsInShortCooldownRequired(ctx, auth, baseModel, time.Now()); errCooldown != nil {
-			return nil, homeKVUnavailableStatusErr(errCooldown)
-		} else if inCooldown && !antigravityShouldBypassShortCooldown(ctx, e.cfg) {
-			log.Debugf("antigravity executor: auth %s in short cooldown for model %s (%s remaining), returning 429 to switch auth", auth.ID, baseModel, remaining)
-			d := remaining
-			return nil, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("auth in short cooldown, %s remaining", remaining), retryAfter: &d}
-		}
+	upstreamModel, tieredModel, tieredCooldownTTL, hasTieredFallback, errCooldown := e.selectAntigravityUpstreamModel(ctx, auth, baseModel, opts.Headers)
+	if errCooldown != nil {
+		return nil, errCooldown
 	}
 
 	reporter := helps.NewExecutorUsageReporter(ctx, e, baseModel, auth)
@@ -132,23 +127,17 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	if replayScope.valid() {
 		replayRequestPayload, _ = antigravityReplayRequestEnvelopeFromDoc(doc)
 	}
-	httpReq, requestPayload, errReq := e.buildRequestDoc(ctx, auth, token, baseModel, doc, true, opts.Alt, baseURL, helps.DerivedAntigravitySessionID(opts.Metadata, req.Metadata))
-	if errReq != nil {
-		err = errReq
-		return nil, err
+	var httpResp *http.Response
+	var requestPayload []byte
+	var errDo error
+	httpResp, upstreamModel, requestPayload, errDo = e.doWithTieredFallback(ctx, auth, token, baseURL, "generate_stream", true, req, opts, doc, baseModel, upstreamModel, tieredModel, tieredCooldownTTL, hasTieredFallback, httpClient, reporter, to)
+	if len(requestPayload) > 0 {
+		translated = requestPayload
 	}
-	translated = requestPayload
-	reporter.SetTranslatedRequestMetadata(requestPayload, to.String())
-	httpResp, errDo := helps.WithAntigravityHTTPClientTrace(httpClient, auth, "generate_stream").Do(httpReq)
 	if errDo != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, errDo)
-		if errors.Is(errDo, context.Canceled) || errors.Is(errDo, context.DeadlineExceeded) {
-			return nil, errDo
-		}
 		err = errDo
 		return nil, err
 	}
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
 	if httpResp.StatusCode < http.StatusOK || httpResp.StatusCode >= http.StatusMultipleChoices {
 		bodyBytes, errRead := io.ReadAll(httpResp.Body)
 		if errClose := httpResp.Body.Close(); errClose != nil {
@@ -175,7 +164,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 			case antigravity429DecisionShortCooldownSwitchAuth:
 				closeAntigravityAuthIdleTransports(auth)
 				if decision.retryAfter != nil && *decision.retryAfter > 0 && !antigravityCoolingDisabled(auth, e.cfg) {
-					if errMarkCooldown := markAntigravityShortCooldownRequired(ctx, auth, baseModel, time.Now(), *decision.retryAfter); errMarkCooldown != nil {
+					if errMarkCooldown := markAntigravityModelsShortCooldown(ctx, auth, baseModel, upstreamModel, time.Now(), *decision.retryAfter); errMarkCooldown != nil {
 						err = homeKVUnavailableStatusErr(errMarkCooldown)
 						return nil, err
 					}
@@ -347,6 +336,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 				if len(p) == 0 {
 					return true
 				}
+				p = antigravityNormalizeResponseModelVersion(p, baseModel, upstreamModel)
 				reporter.ObserveResponseModel(p)
 
 				p = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalPayload, translated, p)
@@ -530,6 +520,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 					if len(shellFiltered) == 0 {
 						continue
 					}
+					shellFiltered = antigravityNormalizeResponseModelVersion(shellFiltered, baseModel, upstreamModel)
 					reporter.ObserveResponseModel(shellFiltered)
 					shellFiltered = e.resolveWebSearchGroundingURLs(ctx, auth, from, originalPayload, translated, shellFiltered)
 					shellChunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, helps.ApplyPatchOriginalRequest(req, opts), translated, bytes.Clone(shellFiltered), &param, claudeInputTokens)
