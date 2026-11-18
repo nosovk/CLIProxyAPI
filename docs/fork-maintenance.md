@@ -2,8 +2,15 @@
 
 ## Patch inventory and rollback
 
-The upstream base for this minimal Home-worker reconstruction is
+The initial upstream base for this minimal Home-worker reconstruction was
 `f2efe2c41305ceb88043d34ce91f61b7765100fe` (`router-for-me/CLIProxyAPI:dev`).
+
+The 2026-11-18 sync rebases onto `9b4f3f30c` (`dev`). The pre-sync head
+`52b444116230a2be855f5d4b3bac0bce84934970` is preserved as
+`archive/fork-before-sync-2026-11-18`. Logging keeps upstream's separation of
+local diagnostics from provider responses: both file and Home JSON logs put
+local failures in `response.errors`, not `api_response_errors`. The Codex
+catalog test follows the refreshed template's empty GPT-5.5 `service_tiers`.
 
 The previous full standalone fork stack is preserved on remote `fork` as
 `backup/standalone-fork-635ac08-2026-11-16`
@@ -41,6 +48,10 @@ and remain preserved on `backup/standalone-fork-635ac08-2026-11-16`:
 - **Home streaming error forwarding**: `homeStreamingLogWriter.Close` must pass
   `w.apiResponseErrors` to `writeJSONLog` in JSON mode so upstream errors remain
   present in `api_response_errors` for downstream log consumers.
+- **Local response diagnostics**: file and Home logs, streaming or not, retain
+  bounded local failures separately from provider errors. Text logs render them
+  in `RESPONSE`; JSON logs use `response.errors` without changing response status
+  or body. `TestResponseDiagnosticsInFileAndHomeLogs` covers all eight paths.
 - **Websocket local interrupt isolation**: `responsesLocalInterrupt` scopes
   local HTTP fallback interrupt claims to the active `responseID` and clears
   it across turn transitions so stale `response.interrupt` frames cannot cancel

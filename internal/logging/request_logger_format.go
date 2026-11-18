@@ -41,7 +41,6 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 	requestTimestamp time.Time,
 	apiResponseTimestamp time.Time,
 ) error {
-	apiResponseErrors, diagnostics := splitResponseDiagnostics(apiResponseErrors)
 	if requestTimestamp.IsZero() {
 		requestTimestamp = time.Now()
 	}
@@ -55,6 +54,7 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 	if format == "json" {
 		return writeJSONLog(w, url, method, requestHeaders, requestBody, requestBodyPath, requestBodyTruncated, statusCode, responseHeaders, response, "", false, decompressErr, apiRequest, apiRequestSource, apiResponse, apiResponseSource, apiResponseErrors, websocketTimeline, websocketTimelineSource, apiWebsocketTimeline, apiWebsocketTimelineSource, requestTimestamp, apiResponseTimestamp, downstreamTransport, upstreamTransport)
 	}
+	apiResponseErrors, diagnostics := splitResponseDiagnostics(apiResponseErrors)
 	if errWrite := writeRequestInfoWithBody(w, url, method, requestHeaders, requestBody, requestBodyPath, requestTimestamp, downstreamTransport, upstreamTransport, !isWebsocketTranscript); errWrite != nil {
 		return errWrite
 	}
