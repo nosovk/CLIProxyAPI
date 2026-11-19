@@ -7790,6 +7790,16 @@ func TestResponsesWebsocketWriterCloseInterruptsBlockedPing(t *testing.T) {
 				return errClose
 			},
 		},
+		{
+			name: "quota disconnect",
+			close: func(w *responsesWebsocketWriter) error {
+				w.closeForUpstreamDisconnect(websocketPinnedFailoverStatusError{
+					status: http.StatusTooManyRequests,
+					msg:    `{"error":{"type":"usage_limit_reached","message":"quota exceeded"}}`,
+				})
+				return nil
+			},
+		},
 	}
 
 	for _, tc := range cases {

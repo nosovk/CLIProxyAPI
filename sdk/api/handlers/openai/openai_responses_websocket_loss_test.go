@@ -1916,7 +1916,14 @@ func TestResponsesWebsocketSameSessionLaterCreate429DoesNotReplayAfterDownstream
 	}
 	close(downstreamGotCreated)
 	_, frame2, errRead2 := conn.ReadMessage()
-	if errRead2 != nil || ojson.GetBytesNoCopy(frame2, "type").String() != "error" || int(ojson.GetBytesNoCopy(frame2, "status").Int()) != http.StatusTooManyRequests {
+	// Receiving response.created does not mean its writer has released writeMu.
+	// A concurrent disconnect deliberately hard-closes a busy writer rather than
+	// waiting behind a potentially blocked write. Both outcomes must avoid replay.
+	if errRead2 != nil {
+		if !websocket.IsCloseError(errRead2, websocket.CloseAbnormalClosure) {
+			t.Fatalf("turn 2 close = %v; want busy-writer disconnect without replay", errRead2)
+		}
+	} else if ojson.GetBytesNoCopy(frame2, "type").String() != "error" || int(ojson.GetBytesNoCopy(frame2, "status").Int()) != http.StatusTooManyRequests {
 		t.Fatalf("turn 2 second frame = %s, err=%v; want terminal 429 error frame without replay", frame2, errRead2)
 	}
 	if authBCreates.Load() != 0 {
