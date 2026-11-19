@@ -12,6 +12,13 @@ local diagnostics from provider responses: both file and Home JSON logs put
 local failures in `response.errors`, not `api_response_errors`. The Codex
 catalog test follows the refreshed template's empty GPT-5.5 `service_tiers`.
 
+The 2026-11-19 sync rebases onto `f19d4a6` (`dev`), retaining upstream's
+restored GPT-5.5 `priority` service tier and the local diagnostics regression.
+CI exposed a websocket cleanup race: the handler could close the socket while
+the disconnect writer was still sending its terminal frame. Cleanup now honors
+the writer's close ownership; a deterministic `synctest` regression covers both
+the terminal 429 payload and the transport close frame.
+
 The previous full standalone fork stack is preserved on remote `fork` as
 `backup/standalone-fork-635ac08-2026-11-16`
 (`635ac082d933c0cc1f421816dafbf9bfc89e33ff`), and the earlier 27-commit stack
@@ -25,6 +32,7 @@ remains preserved as `archive/fork-before-maintenance-2026-11-14`
 | `feat(logging): add bounded NDJSON request and websocket logging` | `internal/logging`, request/response capture middleware, executor log helpers, `request-log-format` config/load/reload/v8/preservation, websocket timeline, and Home streaming JSON forwarding of `w.apiResponseErrors` to `writeJSONLog`. Text remains default; JSON sections are bounded and mark truncation; capture must not alter forwarded bodies; `TestSaveConfigPreserveComments_PrunesDefaultRequestLogFormat` is included here. | `json_logger_test.go`, `request_logger_home_test.go` (including `TestFileRequestLogger_HomeEnabled_ForwardsStreamingJSONAPIErrorResponses`), middleware capture/response tests, websocket bounded timeline test, config pruning test. Remove when upstream supports the same NDJSON schema, bounds, reload, Home error forwarding and timeline behavior. |
 | `fix(compat): preserve websocket interrupts and align upstream contracts` | Websocket `responsesLocalInterrupt` `responseID` tracking and nil guard (`openai_responses_websocket_input.go`, `openai_responses_websocket_forward.go`); Codex model catalog `multi_agent_version` cleanup when opt-in is false (`internal/client/codex/models/models.go` + `server_multi_agent_config_test.go` / `codex_client_models_test.go`, keeping `models_test.go` identical to `f2efe2c41`); v8 translator import boundary, plugin host isolation/cooldown-floor tests, and reviewed kvstore no-copy rationale. | OpenAI websocket/model tests, `internal/api` multi-agent reload tests, pluginhost, util and translator tests. Re-check each hunk on every sync and drop it when upstream covers its regression. |
 | `ci: automate minimal Home-worker fork sync and zero-Python checks` | Fork-only workflows (`.github/workflows/fork-sync-build.yml`, `.github/workflows/fork-checks.yml`), pure-shell scripts under `scripts/fork-ci/` (zero Python: `bump-image.sh` and `test_contracts.sh`), uncached minimal-invariant checks in `test.sh`, and removal of upstream PR contribution guards (`agents-md-guard.yml`, `pr-path-guard.yml`). | Offline CI contracts (`bash scripts/fork-ci/test_contracts.sh`), `shellcheck`, `actionlint`. Retain while this fork publishes its own image; restore upstream guards if changing to an upstream PR branch. |
+| `fix(openai): preserve terminal websocket frames during cleanup` | Handler cleanup uses the websocket writer's close ownership so it cannot truncate an in-flight disconnect frame. | `TestResponsesWebsocketCleanupPreservesPendingDisconnectFrame` runs uncached in fork CI. Remove when upstream preserves terminal JSON and transport close frames during concurrent cleanup. |
 
 ### Retired standalone commits
 

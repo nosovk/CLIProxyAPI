@@ -543,6 +543,7 @@ test_minimal_worker_fork_invariants() {
     TestModelsMultiAgentClientConfigAndReload \
     TestResponsesWebsocketTimelineUsesBoundedJSONSource \
     TestResponsesLateInterruptDoesNotPoisonNextCreate \
+    TestResponsesWebsocketCleanupPreservesPendingDisconnectFrame \
     TestCodexClientModelsResponseMultiAgentV2FollowsConfig; do
     assert_contains "$test_sh_code" "$required_test" "test.sh missing invariant $required_test"
   done
