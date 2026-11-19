@@ -18,6 +18,10 @@ CI exposed a websocket cleanup race: the handler could close the socket while
 the disconnect writer was still sending its terminal frame. Cleanup now honors
 the writer's close ownership; a deterministic `synctest` regression covers both
 the terminal 429 payload and the transport close frame.
+Terminal delivery remains best-effort when a data or Ping writer is already
+busy: disconnect must unblock it immediately. The post-commit no-replay test
+accepts that documented hard close as well as a 429 frame, while still rejecting
+credential replay, other frames, other close codes, and read timeouts.
 
 The previous full standalone fork stack is preserved on remote `fork` as
 `backup/standalone-fork-635ac08-2026-11-16`
