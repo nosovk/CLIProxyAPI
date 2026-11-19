@@ -92,4 +92,5 @@ verify_invariant ./internal/client/codex/models \
 verify_invariant ./sdk/api/handlers/openai \
   TestResponsesWebsocketTimelineUsesBoundedJSONSource \
   TestResponsesLateInterruptDoesNotPoisonNextCreate \
+  TestResponsesWebsocketCleanupPreservesPendingDisconnectFrame \
   TestCodexClientModelsResponseMultiAgentV2FollowsConfig
