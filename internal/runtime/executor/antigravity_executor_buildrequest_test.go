@@ -16,6 +16,34 @@ import (
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 )
 
+func TestAntigravityGenerationByteLimit(t *testing.T) {
+	auth := &cliproxyauth.Auth{Metadata: map[string]any{"project_id": "test-project"}}
+	payload := []byte(`{"request":{"contents":[]}}`)
+	for _, stream := range []bool{false, true} {
+		cfg := &config.Config{}
+		exec := NewAntigravityExecutor(cfg)
+		build := func() (*http.Request, error) {
+			return exec.buildRequest(context.Background(), auth, "token", "gemini-test", payload, stream, "", "https://example.invalid", "fixed-session")
+		}
+		req, err := build()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cfg.Antigravity.MaxGenerationBodyBytes = uint64(len(payload))
+		if req.ContentLength <= int64(len(payload)) {
+			t.Fatal("fixture must expand during translation")
+		}
+		req, err = build()
+		scoped, ok := err.(interface {
+			IsRequestScoped() bool
+			StatusCode() int
+		})
+		if req != nil || !ok || !scoped.IsRequestScoped() || scoped.StatusCode() != 413 {
+			t.Fatalf("stream=%v: got request=%v error=%v", stream, req != nil, err)
+		}
+	}
+}
+
 func TestResolveAntigravityRequestBaseURL(t *testing.T) {
 	t.Run("default uses daily endpoint", func(t *testing.T) {
 		if got := resolveAntigravityRequestBaseURL(&cliproxyauth.Auth{}); got != antigravityBaseURLDaily {

@@ -268,6 +268,9 @@ type ProxyConnectionPoolConfig struct {
 
 // AntigravityConfig configures provider-wide Antigravity request behavior.
 type AntigravityConfig struct {
+	// MaxGenerationBodyBytes caps the serialized upstream inference request (zero disables).
+	MaxGenerationBodyBytes uint64 `yaml:"max-generation-body-bytes,omitempty" json:"max-generation-body-bytes,omitempty"`
+
 	// SensitiveWords is a list of words to obfuscate with invisible combining grapheme joiners in system instructions.
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
 
