@@ -92,6 +92,11 @@ func (e *AntigravityExecutor) buildRequestDoc(ctx context.Context, auth *cliprox
 	applyAntigravityNativeSignatureReplayIfNeededDoc(modelName, doc)
 	helps.FinalizePayloadDoc(ctx, doc)
 	finalPayload := doc.Bytes()
+	if e.cfg != nil {
+		if limit := e.cfg.Antigravity.MaxGenerationBodyBytes; limit > 0 && uint64(len(finalPayload)) > limit {
+			return nil, nil, cliproxyauth.NewRequestScopedError("Antigravity generation request exceeds configured byte limit", http.StatusRequestEntityTooLarge)
+		}
+	}
 	var (
 		bodyReader io.Reader = bytes.NewReader(finalPayload)
 		payloadLog []byte
