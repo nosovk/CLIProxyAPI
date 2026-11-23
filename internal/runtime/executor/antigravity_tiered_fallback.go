@@ -381,22 +381,21 @@ func antigravityNormalizeResponseModelVersion(payload []byte, requestedBaseModel
 	}
 	_ = actualUpstreamModel
 
-	out := payload
-	if res := ojson.GetBytesNoCopy(out, "response.modelVersion"); res.Type == ojson.String {
-		if mapped, ok := antigravityNormalizeModelVersionValue(res.String(), requestedBaseModel); ok {
-			if updated, err := ojson.SetBytes(out, "response.modelVersion", mapped); err == nil {
-				out = updated
+	var doc *ojson.Doc
+	for _, path := range []string{"response.modelVersion", "modelVersion"} {
+		if res := ojson.GetBytesNoCopy(payload, path); res.Type == ojson.String {
+			if mapped, ok := antigravityNormalizeModelVersionValue(res.String(), requestedBaseModel); ok {
+				if doc == nil {
+					doc = ojson.NewDoc(payload)
+				}
+				_ = doc.Set(path, mapped)
 			}
 		}
 	}
-	if res := ojson.GetBytesNoCopy(out, "modelVersion"); res.Type == ojson.String {
-		if mapped, ok := antigravityNormalizeModelVersionValue(res.String(), requestedBaseModel); ok {
-			if updated, err := ojson.SetBytes(out, "modelVersion", mapped); err == nil {
-				out = updated
-			}
-		}
+	if doc != nil {
+		return doc.Bytes()
 	}
-	return out
+	return payload
 }
 
 // selectAntigravityUpstreamModel resolves the initial upstream model for an Antigravity
@@ -411,14 +410,14 @@ func (e *AntigravityExecutor) selectAntigravityUpstreamModel(
 	tieredModel, tieredCooldownTTL, hasTieredFallback = antigravityResolveTieredFallback(baseModel, headers)
 	if hasTieredFallback && (!antigravityAuthSupportsTieredModel(auth, baseModel, tieredModel, now) ||
 		cliproxyauth.CheckAntigravityTargetModel(ctx, auth, tieredModel, now, antigravityShouldBypassShortCooldown(ctx, e.cfg)) != nil) {
-		log.Debugf("antigravity executor: auth %s does not support or blocked tiered model %s, skipping fallback", auth.ID, tieredModel)
+		log.Debugf("antigravity executor: auth %s does not support or blocked tiered model %s, skipping fallback", antigravityAuthID(auth), tieredModel)
 		hasTieredFallback = false
 		tieredModel = ""
 		tieredCooldownTTL = 0
 	}
 	upstreamModel = baseModel
 	if hasTieredFallback && antigravityShouldUseTieredImmediately(ctx, auth, baseModel, now) {
-		log.Debugf("antigravity executor: auth %s using cached tiered fallback %s -> %s", auth.ID, baseModel, tieredModel)
+		log.Debugf("antigravity executor: auth %s using cached tiered fallback %s -> %s", antigravityAuthID(auth), baseModel, tieredModel)
 		upstreamModel = tieredModel
 	}
 	if antigravityCoolingDisabled(auth, e.cfg) {
@@ -431,11 +430,11 @@ func (e *AntigravityExecutor) selectAntigravityUpstreamModel(
 			if tieredInCooldown, _, errTieredCooldown := antigravityIsInShortCooldownRequired(ctx, auth, tieredModel, now); errTieredCooldown != nil {
 				return "", "", 0, false, homeKVUnavailableStatusErr(errTieredCooldown)
 			} else if !tieredInCooldown {
-				log.Debugf("antigravity executor: auth %s base model %s in short cooldown (%s remaining), switching to tiered fallback %s", auth.ID, baseModel, remaining, tieredModel)
+				log.Debugf("antigravity executor: auth %s base model %s in short cooldown (%s remaining), switching to tiered fallback %s", antigravityAuthID(auth), baseModel, remaining, tieredModel)
 				return tieredModel, tieredModel, tieredCooldownTTL, hasTieredFallback, nil
 			}
 		}
-		log.Debugf("antigravity executor: auth %s in short cooldown for model %s (%s remaining), returning 429 to switch auth", auth.ID, upstreamModel, remaining)
+		log.Debugf("antigravity executor: auth %s in short cooldown for model %s (%s remaining), returning 429 to switch auth", antigravityAuthID(auth), upstreamModel, remaining)
 		d := remaining
 		return "", "", 0, false, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("auth in short cooldown, %s remaining", remaining), retryAfter: &d}
 	}

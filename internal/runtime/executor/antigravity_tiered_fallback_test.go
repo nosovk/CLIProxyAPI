@@ -5,12 +5,14 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/MoeForge/moego/ojson"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/kvstore"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
@@ -509,5 +511,113 @@ func TestAntigravityTieredFallbackHeadersAndNormalization(t *testing.T) {
 	}
 	if antigravityShouldUseTieredImmediately(context.Background(), auth, "gemini-4-hydrogen-xhigh", now.Add(120*time.Second)) {
 		t.Fatal("expected cache expiration at TTL boundary")
+	}
+}
+
+func TestAntigravityTieredFallbackThinkingSelectionAndFinalPayloadRules(t *testing.T) {
+	for _, tc := range []struct {
+		name, group string
+		stream      bool
+	}{
+		{"generate", "gemini-3.8-flash", false},
+		{"stream", "gemini-3.8-flash", true},
+		{"aggregated Claude", "claude-demo", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resetAntigravityTieredFallbackCacheForTest()
+			t.Cleanup(resetAntigravityTieredFallbackCacheForTest)
+			client := newFakeAntigravityKVClient()
+			useFakeAntigravityKVClient(t, client, true, nil)
+			high, low, tiered := tc.group+"-high", tc.group+"-low", tc.group+"-tiered"
+			scope := strings.Repeat("f", 64)
+			var mu sync.Mutex
+			var bodies [][]byte
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				mu.Lock()
+				bodies = append(bodies, body)
+				mu.Unlock()
+				if ojson.GetBytesNoCopy(body, "model").String() == low {
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = io.WriteString(w, `{"error":{"code":429,"status":"RESOURCE_EXHAUSTED"}}`)
+					return
+				}
+				const response = `{"response":{"candidates":[{"content":{"role":"model","parts":[{"text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1,"candidatesTokenCount":1,"totalTokenCount":2}}}`
+				if r.URL.Path == antigravityStreamPath {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, "data: "+response+"\n\n")
+				} else {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, response)
+				}
+			}))
+			defer server.Close()
+			auth := newTestAntigravityAuth(t.Name(), server.URL)
+			auth.Provider = "antigravity"
+			auth.Attributes[cliproxyauth.AntigravityModelEnumHomeScopeAttribute] = scope
+			key := "antigravity:model-enums:v1:" + kvstore.HashKeyPart(auth.ID) + ":" + scope
+			client.values[key] = mustAntigravityJSON(t, map[string]any{
+				"scope":          scope,
+				"models":         map[string]string{high: "HIGH_ENUM", low: "LOW_ENUM", tiered: "TIERED_ENUM"},
+				"thinkingGroups": map[string]map[string]int{tc.group: {"high": 40000, "low": 50000}},
+			})
+			cfg := &config.Config{Payload: config.PayloadConfig{
+				Override: []config.PayloadRule{{
+					Models: []config.PayloadModelRule{{Name: low, Protocol: "antigravity"}},
+					Params: map[string]any{"generationConfig.temperature": 0.25},
+				}, {
+					Models: []config.PayloadModelRule{{Name: tiered, Protocol: "antigravity"}},
+					Params: map[string]any{"generationConfig.maxOutputTokens": 1234},
+				}},
+				Filter: []config.PayloadFilterRule{{
+					Models: []config.PayloadModelRule{{Name: tiered, Protocol: "antigravity"}},
+					Params: []string{"labels.model_enum", "sessionId", "model"},
+				}},
+			}}
+			exec := NewAntigravityExecutor(cfg)
+			finalizations := 0
+			opts := cliproxyexecutor.Options{
+				SourceFormat: sdktranslator.FormatOpenAI, ResponseFormat: sdktranslator.FormatOpenAI,
+				Headers:  make(http.Header),
+				Metadata: map[string]any{cliproxyexecutor.FinalizedResponseFormatCallbackMetadataKey: func(string) { finalizations++ }},
+			}
+			opts.Headers.Set(antigravityHeaderTieredFallbackModel, tiered)
+			req := cliproxyexecutor.Request{Model: high, Payload: []byte(`{"reasoning_effort":"low","messages":[{"role":"user","content":"hi"}]}`)}
+			for range 2 {
+				if tc.stream {
+					res, err := exec.ExecuteStream(t.Context(), auth, req, opts)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for chunk := range res.Chunks {
+						if chunk.Err != nil {
+							t.Fatal(chunk.Err)
+						}
+					}
+				} else if _, err := exec.Execute(t.Context(), auth, req, opts); err != nil {
+					t.Fatal(err)
+				}
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(bodies) != 3 || finalizations != 3 {
+				t.Fatalf("requests = %d, payload finalizations = %d; want 3 each", len(bodies), finalizations)
+			}
+			for i, body := range bodies {
+				got := ojson.ParseBytes(body)
+				wantModel := tiered
+				if i == 0 {
+					wantModel = low
+					if got.Get("request.labels.model_enum").String() != "LOW_ENUM" {
+						t.Errorf("first attempt lost the selected variant enum: %s", body)
+					}
+				} else if got.Get("request.labels.model_enum").Exists() || got.Get("request.sessionId").Exists() || got.Get("request.model").Exists() || got.Get("request.generationConfig.maxOutputTokens").Int() != 1234 {
+					t.Errorf("attempt %d overwrote final payload rules: %s", i, body)
+				}
+				if got.Get("model").String() != wantModel || got.Get("request.generationConfig.temperature").Float() != 0.25 {
+					t.Errorf("attempt %d lost selected model or source-model rules: %s", i, body)
+				}
+			}
+		})
 	}
 }

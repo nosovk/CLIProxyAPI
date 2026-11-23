@@ -23,6 +23,24 @@ busy: disconnect must unblock it immediately. The post-commit no-replay test
 accepts that documented hard close as well as a 429 frame, while still rejecting
 credential replay, other frames, other close codes, and read timeouts.
 
+The 2026-11-23 sync rebases onto `62c419e0492011bb2b668f364b2e505afa3fbdb2`
+(`dev`). The pre-sync head `122c51cfae5d5586a27eec2c6a12dd3ca2807b57` is
+preserved locally as `archive/fork-before-sync-2026-11-23`. Request log defaults
+and normalization now live in upstream's shared startup parser. Tiered fallback
+uses the refreshed credential and selected thinking variant, preserves scoped
+session IDs and shared upstream error handling, and applies payload rules once
+per attempt, including cached and immediate fallback requests. The regression
+covers streaming, non-streaming and aggregated Claude responses.
+
+Four failures were reproduced on the clean upstream base before fixing them:
+tool-call test helpers did not assemble incremental argument chunks, an
+Antigravity Responses test expected the old interrupted-turn ordering, and both
+Vertex Imagen streaming paths dereferenced a nil scanner. A flaky credits top-up
+test also waited on the old unscoped refresh key instead of the current
+credential-scoped task. The sync updates the obsolete test expectations and
+synchronization and adds the missing scanner guards; existing Imagen protocol
+tests exercise both credential paths.
+
 The previous full standalone fork stack is preserved on remote `fork` as
 `backup/standalone-fork-635ac08-2026-11-16`
 (`635ac082d933c0cc1f421816dafbf9bfc89e33ff`), and the earlier 27-commit stack
@@ -37,6 +55,7 @@ remains preserved as `archive/fork-before-maintenance-2026-11-14`
 | `fix(compat): preserve websocket interrupts and align upstream contracts` | Websocket `responsesLocalInterrupt` `responseID` tracking and nil guard (`openai_responses_websocket_input.go`, `openai_responses_websocket_forward.go`); Codex model catalog `multi_agent_version` cleanup when opt-in is false (`internal/client/codex/models/models.go` + `server_multi_agent_config_test.go` / `codex_client_models_test.go`, keeping `models_test.go` identical to `f2efe2c41`); v8 translator import boundary, plugin host isolation/cooldown-floor tests, and reviewed kvstore no-copy rationale. | OpenAI websocket/model tests, `internal/api` multi-agent reload tests, pluginhost, util and translator tests. Re-check each hunk on every sync and drop it when upstream covers its regression. |
 | `ci: automate minimal Home-worker fork sync and zero-Python checks` | Fork-only workflows (`.github/workflows/fork-sync-build.yml`, `.github/workflows/fork-checks.yml`), pure-shell scripts under `scripts/fork-ci/` (zero Python: `bump-image.sh` and `test_contracts.sh`), uncached minimal-invariant checks in `test.sh`, and removal of upstream PR contribution guards (`agents-md-guard.yml`, `pr-path-guard.yml`). | Offline CI contracts (`bash scripts/fork-ci/test_contracts.sh`), `shellcheck`, `actionlint`. Retain while this fork publishes its own image; restore upstream guards if changing to an upstream PR branch. |
 | `fix(openai): preserve terminal websocket frames during cleanup` | Handler cleanup uses the websocket writer's close ownership so it cannot truncate an in-flight disconnect frame. | `TestResponsesWebsocketCleanupPreservesPendingDisconnectFrame` runs uncached in fork CI. Remove when upstream preserves terminal JSON and transport close frames during concurrent cleanup. |
+| `feat(antigravity): add tiered fallback routing` | Credential-scoped temporary redirects after HTTP 429, capability and target-admission checks, Home KV persistence, response model normalization, and final payload rules on every attempt. | `antigravity_tiered_fallback_test.go`, especially `TestAntigravityTieredFallbackThinkingSelectionAndFinalPayloadRules`; retain until upstream provides equivalent fallback behavior. |
 
 ### Retired standalone commits
 
