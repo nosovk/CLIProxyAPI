@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"net/http"
 	"testing"
 	"time"
 
@@ -12,10 +13,11 @@ func TestIssue7741WrapStreamResultClosesOnCancellationDuringUpstreamStall(t *tes
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
-	remaining := make(chan cliproxyexecutor.StreamChunk)
+	remaining := make(chan cliproxyexecutor.StreamChunk, 1)
 	t.Cleanup(func() { close(remaining) })
 
-	manager := NewManager(nil, nil, nil)
+	resultReported := make(chan struct{})
+	manager := NewManager(nil, nil, lifecycleTestHook{result: func() { close(resultReported) }})
 	result := manager.wrapStreamResult(
 		ctx,
 		&Auth{ID: "issue7741-auth", Provider: "issue7741"},
@@ -31,9 +33,7 @@ func TestIssue7741WrapStreamResultClosesOnCancellationDuringUpstreamStall(t *tes
 		1,
 	)
 
-	go func() {
-		remaining <- cliproxyexecutor.StreamChunk{Payload: []byte(`{"type":"response.created"}`)}
-	}()
+	remaining <- cliproxyexecutor.StreamChunk{Payload: []byte(`{"type":"response.created"}`)}
 
 	select {
 	case chunk, ok := <-result.Chunks:
@@ -56,5 +56,16 @@ func TestIssue7741WrapStreamResultClosesOnCancellationDuringUpstreamStall(t *tes
 		}
 	case <-time.After(time.Second):
 		t.Fatal("output did not close when context was canceled during upstream stall")
+	}
+
+	remaining <- cliproxyexecutor.StreamChunk{Err: &Error{
+		Code:       ErrorCodeTransientTransport,
+		Message:    "upstream failed after partial output",
+		HTTPStatus: http.StatusBadGateway,
+	}}
+	select {
+	case <-resultReported:
+	case <-time.After(time.Second):
+		t.Fatal("terminal upstream failure was not recorded after cancellation")
 	}
 }

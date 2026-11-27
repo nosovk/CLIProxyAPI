@@ -243,13 +243,15 @@ func (m *Manager) wrapStreamResultWithCancel(ctx context.Context, auth *Auth, pr
 		}
 		emit := func(chunk cliproxyexecutor.StreamChunk) bool {
 			if chunk.Err != nil && !failed {
+				rerr := resultErrorFromError(chunk.Err)
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					if retryAfterFromError(chunk.Err) != nil {
 						m.recordCanceledUpstreamCooldown(ctx, auth, provider, resultModel, routeModel, opts, chunk.Err, ephemeralResult, executionSeq)
 						failed = true
 						return false
 					}
-					if !isRequestScopedError(chunk.Err) {
+					upstreamTransientFailure := isTransientTransportResultError(rerr) && statusCodeFromResult(rerr) != 0
+					if !isRequestScopedError(chunk.Err) && !upstreamTransientFailure {
 						failed = true
 						return false
 					}
@@ -257,7 +259,6 @@ func (m *Manager) wrapStreamResultWithCancel(ctx context.Context, auth *Auth, pr
 				failed = true
 				entry := logEntryWithRequestID(ctx)
 				warnLogUpstreamFailure(ctx, entry, provider, resultModel, auth, time.Since(streamStart), chunk.Err)
-				rerr := resultErrorFromError(chunk.Err)
 				action, okAction := matchRequestScopedErrorAction(auth, chunk.Err, m.requestScopedErrorConfig(ctx))
 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, RouteModel: routeModel, Success: false, Error: rerr, Options: opts, AccessToken: accessToken, CredentialVersion: auth.CredentialVersion, RegistrationEpoch: auth.RegistrationEpoch, ExecutionSeq: executionSeq}
 				result.RetryAfter = retryAfterFromError(chunk.Err)
@@ -329,15 +330,31 @@ func (m *Manager) wrapStreamResultWithCancel(ctx context.Context, auth *Auth, pr
 				return true
 			}
 		}
+		stopForwarding := func() {
+			if cancelAttempt != nil {
+				cancelAttempt()
+			}
+			if remaining == nil || failed || ctx == nil || ctx.Err() == nil {
+				discardStreamChunks(remaining)
+				return
+			}
+			// Close the downstream promptly, but keep recording upstream failures
+			// when the executor emits its error just after the client disconnects.
+			forward = false
+			go func() {
+				for chunk := range remaining {
+					if chunk.Err != nil && !failed {
+						emit(chunk)
+					}
+				}
+			}()
+		}
 		for _, chunk := range buffered {
 			if !forward {
 				break
 			}
 			if ok := emit(chunk); !ok {
-				if cancelAttempt != nil {
-					cancelAttempt()
-				}
-				discardStreamChunks(remaining)
+				stopForwarding()
 				return
 			}
 		}
@@ -354,10 +371,7 @@ func (m *Manager) wrapStreamResultWithCancel(ctx context.Context, auth *Auth, pr
 				default:
 					select {
 					case <-ctx.Done():
-						if cancelAttempt != nil {
-							cancelAttempt()
-						}
-						discardStreamChunks(remaining)
+						stopForwarding()
 						return
 					case chunk, open = <-remaining:
 					}
@@ -372,10 +386,7 @@ func (m *Manager) wrapStreamResultWithCancel(ctx context.Context, auth *Auth, pr
 				continue
 			}
 			if ok := emit(chunk); !ok {
-				if cancelAttempt != nil {
-					cancelAttempt()
-				}
-				discardStreamChunks(remaining)
+				stopForwarding()
 				return
 			}
 		}
